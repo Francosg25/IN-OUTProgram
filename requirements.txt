@@ -1,7 +1,4 @@
-fastapi
-uvicorn
 python-dotenv
 pandas
 openpyxl
-requests
 streamlit

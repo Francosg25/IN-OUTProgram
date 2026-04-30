@@ -11,12 +11,12 @@ class CostAllocationEngine:
 
     def _clean_ref(self, ref: Any) -> str:
         """
-        Extrae la referencia usando el patrón exacto FG-R-####LE##.
-        Si no hay match, devuelve None para activar el fallback a BU.
+        Extrae la referencia usando el patrón: \w?\w-J-\d{4}LI\d{2}
         """
         if pd.isna(ref): return None
         
-        pattern = r"FG-R-\d{4}LE\d{2}"
+        # Patrón flexible: letras/números opcionales + -J- + 4 dígitos + LI + 2 dígitos
+        pattern = r"\w?\w-J-\d{4}LI\d{2}"
         match = re.search(pattern, str(ref).upper())
         
         if match:

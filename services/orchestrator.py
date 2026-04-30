@@ -10,32 +10,40 @@ class LogisticsPipelineOrchestrator:
         self.allocation_engine = allocation_engine
         
         self.aliases = {
-            'reference': ['REFERENCE', 'CONTAINER NUMBER', 'WAYBILL NUMBER', 'REFERENCIA'],
+            'reference': ['REFERENCE', 'CONTAINER NUMBER', 'WAYBILL NUMBER', 'REFERENCIA', 'CONTAINER'],
             'bu': ['BU', 'OU', 'BUSINESS UNIT', 'UNIDAD DE NEGOCIO'],
             'gross_weight': ['GROSS WEIGHT (KGS)', 'TOTAL GROSS WEIGHT', 'PESO BRUTO (KGS)', 'WEIGHT'],
             'inbound': ['INBOUND'],
+            'outbound': ['OUTBOUND'],
             'method': ['METHOD'],
-            'part_number': ['NO DE PARTE', 'PART NUMBER']
+            'part_number': ['NO DE PARTE', 'PART NUMBER', 'ITEM CODE']
         }
         
-        # Lista Blanca (Whitelist) de BUs permitidas.
-        # Ajusta esta lista con los 5 o6 códigos reales que operan en la planta.
         self.valid_bus = {'M01', 'M02', 'M19', 'M23', 'M45'} 
     
     def clean_bu_code(self, raw_bu: Any) -> str:
-        """
-        Sanitizador puro: Elimina basura, normaliza y valida contra la lista blanca.
-        """
-        if pd.isna(raw_bu):
-            return 'DEFAULT_BU'
+             if pd.isna(raw_bu):
+                 return 'DEFAULT_BU'
+    
+             # 1. Normalización básica
+             clean_str = str(raw_bu).strip().upper()
+             clean_str = re.sub(r'[^A-Z0-9]', '', clean_str)
+    
+             # 2. Validación de rango M00 - M1000
+             match = re.match(r'^M(\d{1,4})$', clean_str)
+             if match:
+                num = int(match.group(1))
+                if 0 <= num <= 1000:
+                    return clean_str # Es una BU válida en el rango
+
+             return clean_str if clean_str else 'DEFAULT_BU'
             
-        # 1. Cast a string, mayúsculas, y eliminación de espacios en los extremos
-        clean_str = str(raw_bu).strip().upper()
+             clean_str = str(raw_bu).strip().upper()
         
-        # 2. Regex: Eliminar cualquier caracter que no sea alfanumérico (ej. \xa0, guiones)
-        clean_str = re.sub(r'[^A-Z0-9]', '', clean_str)
+             clean_str = re.sub(r'[^A-Z0-9]', '', clean_str)
         
-        return clean_str if clean_str else 'DEFAULT_BU'
+             return clean_str if clean_str else 'DEFAULT_BU'
+    
 
     def _extract_and_standardize(self, file_path: Any, source_type: str, transport_label: str) -> pd.DataFrame:
         try:
@@ -65,10 +73,33 @@ class LogisticsPipelineOrchestrator:
                         # Columnas opcionales (como inbound, method, part_number)
                         df_std[canon_col] = None
 
-            # --- NUEVA CAPA DE SANITIZACIÓN ---
-            # Aplicamos la función de limpieza vectorizada a toda la columna
             if 'bu' in df_std.columns:
                 df_std['bu'] = df_std['bu'].apply(self.clean_bu_code)
+
+            def apply_business_rules(row):
+                part_val = str(row['part_number']).upper() if row['part_number'] else ""
+                
+                # 1. REGLA CAPEX: Si contiene "CAPEX" o NO tiene números (solo letras/guiones)
+                if "CAPEX" in part_val or (part_val and part_val != 'NONE' and not any(char.isdigit() for char in part_val)):
+                    return "Capex"
+                
+                # 2. REGLA MISCELANEUS (Heurística de Descripción):
+                # Si el "Número de Parte" es en realidad una descripción larga (ej. ZOWIETEK 5-50MM...)
+                # Criterios: Más de 3 espacios O longitud > 25 caracteres con al menos 2 espacios.
+                num_spaces = part_val.count(' ')
+                if num_spaces > 3 or (len(part_val) > 25 and num_spaces >= 2):
+                    return 'Miscelaneus'
+                
+                # 3. REGLA MISCELANEUS (Palabras clave tradicionales)
+                miscelaneus_keywords = ['TAPA PLASTICA', 'CHAROLA', 'BASE PLASTICA', 'TAPA', 'BASE']
+                for kw in miscelaneus_keywords:
+                    if kw in part_val:
+                        return 'Miscelaneus'
+                
+                return row['bu']
+            
+            if 'part_number' in df_std.columns and 'bu' in df_std.columns:
+                df_std['bu'] = df_std.apply(apply_business_rules, axis=1)
 
             df_std['transport_type'] = transport_label
             df_std['gross_weight'] = pd.to_numeric(df_std['gross_weight'], errors='coerce').fillna(0)
