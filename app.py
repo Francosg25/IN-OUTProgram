@@ -1,52 +1,19 @@
 import streamlit as st
-import sys
-from pathlib import Path
+import pandas as pd
+import requests
 
-# --- ANCLAJE DE RUTAS ROBUSTO ---
-# Obtenemos la ruta absoluta de la carpeta raíz (IN-OUTProgram)
-ROOT_DIR = Path(__file__).resolve().parent
-
-# Agregamos la raíz al principio de sys.path
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
-try:
-    from services.orchestrator import LogisticsPipelineOrchestrator
-except ModuleNotFoundError as e:
-    st.error(f"No se encontró el módulo: {e.name}")
-    st.info(f"Buscando en: {ROOT_DIR}")
-    # Listamos directorios para debug
-    st.code(f"Directorios en la raíz: {[d.name for d in ROOT_DIR.iterdir() if d.is_dir()]}")
-    st.stop()
-
-# Asegúrate de tener estas importaciones al inicio de tu app.py
-from engine.allocation import CostAllocationEngine  # Ajusta el nombre de la clase/ruta si es distinto
-from services.orchestrator import LogisticsPipelineOrchestrator
+# Configuración del Backend
+API_URL = "http://localhost:8000/process-logistics"
 
 def main():
-    st.title("Logistics Data Orchestrator")
+    st.set_page_config(page_title="In-Out Logistics", layout="wide")
+    st.title("Logistics Data Orchestrator (Frontend)")
     st.markdown("---")
 
-    try:
-        # Instanciamos la dependencia (el motor matemático)
-        # Puedes cambiar 'weight' por 'full_container' según tu lógica de negocio
-        engine_instance = CostAllocationEngine(allocation_type='weight') 
-
-        # 2. Inyectamos la dependencia al constructor del orquestador
-        orchestrator = LogisticsPipelineOrchestrator(allocation_engine=engine_instance)
-        
-    except Exception as e:
-        st.error(f"Error inicializando los servicios core: {e}")
-        st.stop()
-    
-    orchestrator = LogisticsPipelineOrchestrator()
-
-    # Sidebar para carga de archivos maestros (Bases de Datos / Consolidados)
     with st.sidebar:
         st.header("Bases de Datos Maestras")
         cost_file = st.file_uploader("Consolidado de Facturación (Costos)", type=["xlsx"])
         
-    # Área principal para archivos de operación
     col_a, col_b, col_c = st.columns(3)
     with col_a:
         st.subheader("Sea / China")
@@ -60,54 +27,59 @@ def main():
 
     st.markdown("---")
 
-    # Lógica de procesamiento
-    if st.button("⚡ Ejecutar Procesamiento y Prorrateo", use_container_width=True):
+    if st.button("Ejecutar Procesamiento (vía API)", use_container_width=True):
         if not cost_file:
-            st.warning("Por favor, sube el archivo de Consolidado de Facturación en la barra lateral.")
-            return
-
-        # Construcción del diccionario de archivos para el orquestador
-        # Filtramos solo los que el usuario haya subido
-        files_to_process = {}
-        if sea_file: files_to_process['Sea'] = sea_file
-        if land_file: files_to_process['Land'] = land_file
-        if outbound_file: files_to_process['Outbound'] = outbound_file
-
-        if not files_to_process:
-            st.error("No hay archivos de operación cargados para procesar.")
+            st.warning("Por favor, sube el archivo de Consolidado de Facturación.")
             return
 
         try:
-            with st.spinner("🔄 Procesando reglas de negocio y reconciliación de costos..."):
-                # 1. Cargar el consolidado de costos
-                df_costs = pd.read_excel(cost_file)
+            with st.spinner("🚀 Llamando al Microservicio de Procesamiento..."):
+                # Preparar archivos para enviar por HTTP
+                files = {
+                    "cost_file": (cost_file.name, cost_file.getvalue(), cost_file.type)
+                }
+                if sea_file: files["sea_file"] = (sea_file.name, sea_file.getvalue(), sea_file.type)
+                if land_file: files["land_file"] = (land_file.name, land_file.getvalue(), land_file.type)
+                if outbound_file: files["outbound_file"] = (outbound_file.name, outbound_file.getvalue(), outbound_file.type)
+
+                # Petición al Backend
+                response = requests.post(API_URL, files=files)
                 
-                # 2. Ejecutar Pipeline completo a través del Orquestador
-                final_summary = orchestrator.run_full_process(files_to_process, df_costs)
-                
-                # 3. Mostrar resultados
-                st.success("✅ Procesamiento completado con éxito.")
-                
-                # Pestañas para organizar la visualización
-                tab_summary, tab_details = st.tabs(["📊 Resumen (Summary)", "📝 Detalles por Transacción"])
-                
-                with tab_summary:
-                    st.table(final_summary)
-                    st.download_button(
-                        "Descargar Summary (CSV)",
-                        data=final_summary.to_csv(index=False),
-                        file_name="summary_logistica.csv",
-                        mime="text/csv"
-                    )
-                
-                with tab_details:
-                    st.write("Vista previa de datos procesados:")
-                    # Aquí podrías mostrar el master_df si el orquestador lo devuelve
-                    st.info("Desglose detallado disponible para auditoría.")
+                if response.status_code == 200:
+                    data = response.json()
+                    final_summary = pd.DataFrame(data["summary"])
+                    recon = data["reconciliation"]
+                    
+                    st.success("✅ Procesamiento completado con éxito.")
+                    
+                    # --- AUDITORÍA ---
+                    if recon:
+                        st.markdown("### 🔍 Estado de Conciliación")
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Total Facturado", f"${recon['total_facturado']:,.2f}")
+                        c2.metric("Total Asignado", f"${recon['total_asignado']:,.2f}")
+                        diff = recon['diferencia']
+                        c3.metric("Diferencia", f"${diff:,.2f}", delta=f"{diff:,.2f}", delta_color="normal" if abs(diff) < 1 else "inverse")
+                        c4.metric("Match Rate", f"{recon['match_rate']:.1f}%")
+
+                    # --- VISUALIZACIÓN ---
+                    tabs = st.tabs(["📊 Resumen General", "🚢 Sea", "🚛 Land", "📦 Outbound"])
+                    
+                    with tabs[0]:
+                        st.dataframe(final_summary, use_container_width=True)
+                    
+                    for i, label in enumerate(["Sea", "Land", "Outbound"], 1):
+                        with tabs[i]:
+                            df_f = final_summary[final_summary['Transport'] == label]
+                            if not df_f.empty:
+                                st.table(df_f)
+                            else:
+                                st.info(f"Sin datos para {label}")
+                else:
+                    st.error(f"Error en el Backend: {response.text}")
 
         except Exception as e:
-            st.error(f"Error durante la ejecución: {str(e)}")
-            st.exception(e) # Solo usar durante desarrollo/debugging
+            st.error(f"Fallo de conexión con la API: {e}")
 
 if __name__ == "__main__":
     main()
