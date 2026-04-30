@@ -1,0 +1,17 @@
+[server]
+# Aumenta el límite de subida (ejemplo: 1GB)
+maxUploadSize = 1000 
+# Dirección IP donde escuchará el servidor
+address = "0.0.0.0"
+port = 8501
+
+[browser]
+# Desactiva la recolección de estadísticas para mayor privacidad
+gatherUsageStats = false
+
+[theme]
+# Opcional: Personalización rápida para entorno industrial
+primaryColor = "#007AFF"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0F2F6"
+textColor = "#262730"
