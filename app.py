@@ -37,7 +37,7 @@ def smart_read_excel(file_obj) -> pd.DataFrame:
     """
     try:
         # Leemos las primeras 30 filas sin asignar encabezados
-        df_temp = smart_read_excel(file_obj, nrows=30)
+        df_temp = smart_read_excel(file_obj)
         header_idx = 0
         
         # Palabras clave que suelen estar en un encabezado logístico
