@@ -139,16 +139,13 @@ def find_best_column(columns_list: list, keywords: list) -> str:
     return None
 
 def suggest_mapping(df: pd.DataFrame) -> dict:
-    """
-    Genera sugerencias de mapeo usando el escáner heurístico.
-    """
     cols = df.columns.tolist()
     return {
         'reference': find_best_column(cols, ['reference', 'ref', 'guia', 'guía', 'documento', 'doc', 'tracking', 'awb', 'waybill']),
+        'container_number': find_best_column(cols, ['container', 'contenedor', 'cntr', 'caja', 'equipo']),
         'bu': find_best_column(cols, ['bu', 'unidad de negocio', 'unidad', 'business unit', 'businessunit', 'area', 'division']),
         'gross_weight': find_best_column(cols, ['gross_weight', 'peso', 'weight', 'kg', 'kgs']),
         'price': find_best_column(cols, ['price', 'precio', 'cost', 'valor', 'amount', 'monto']),
-        # ¡Añadimos la columna del número de parte para que funcione el motor de reglas (Capex/Misc)!
         'part_number': find_best_column(cols, ['part_number', 'part number', 'numero de parte', 'no. parte', 'item', 'item code'])
     }
 
@@ -303,12 +300,14 @@ def main():
                     return st.selectbox(label_text, cols, index=index, key=key)
 
                 default_ref = saved.get('reference') or suggested.get('reference')
+                default_container = saved.get('container_number') or suggested.get('container_number')
                 default_bu = saved.get('bu') or suggested.get('bu')
                 default_w = saved.get('gross_weight') or suggested.get('gross_weight')
                 default_price = saved.get('price') or suggested.get('price')
                 default_part = saved.get('part_number') or suggested.get('part_number')
 
                 m_ref = select_with_default(f"Referencia / Guía ({label})", f"sel_ref_{label}", default_ref)
+                m_container = select_with_default(f"Número de Contenedor ({label})", f"sel_container_{label}", default_container)
                 m_bu = select_with_default(f"Unidad de Negocio ({label})", f"sel_bu_{label}", default_bu)
                 m_w = select_with_default(f"Peso Bruto ({label}) - Opcional", f"sel_w_{label}", default_w)
                 m_price = select_with_default(f"Precio / Valor ({label}) - Opcional", f"sel_price_{label}", default_price)
@@ -316,6 +315,7 @@ def main():
 
                 if m_ref and m_bu:
                     mapping = {"reference": m_ref, "bu": m_bu}
+                    if m_container: mapping["container_number"] = m_container
                     if m_w: mapping["gross_weight"] = m_w
                     if m_price: mapping["price"] = m_price
                     if m_part: mapping["part_number"] = m_part # Guarda el mapeo del no. de parte

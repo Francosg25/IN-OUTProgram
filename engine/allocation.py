@@ -1,106 +1,129 @@
 import pandas as pd
+import numpy as np
 import logging
 import re
 from typing import Literal, Any
+
+# 1. IMPORTAR EL MOTOR DE REGLAS
+from engine.rules import BusinessRulesEngine
 
 logger = logging.getLogger(__name__)
 
 class CostAllocationEngine:
     def __init__(self, allocation_type: Literal['weight', 'full_container'] = 'weight'):
         self.allocation_type = allocation_type
+        # Tarifas de respaldo en caso de que Finanzas no reporte el costo
+        self.fallback_costs = {
+            'sea': 2500.0,
+            'land': 1200.0,
+            'outbound': 2000.0
+        }
 
     def _clean_ref(self, ref: Any) -> str:
         """
-        Extrae la referencia usando el patrón: \w?\w-J-\d{4}LI\d{2}
+        Limpia referencias y contenedores usando Regex o limpieza alfanumérica estándar.
         """
         if pd.isna(ref): return None
         
-        # Patrón flexible: letras/números opcionales + -J- + 4 dígitos + LI + 2 dígitos
+        # Patrón específico si aplica
         pattern = r"\w?\w-J-\d{4}LI\d{2}"
         match = re.search(pattern, str(ref).upper())
         
         if match:
             return match.group(0)
-        return None
+        # Fallback genérico: quitar espacios y caracteres raros
+        return re.sub(r'[^A-Z0-9]', '', str(ref).upper())
 
     def calculate_outbound(self, df_transactions: pd.DataFrame, df_costs: pd.DataFrame) -> pd.DataFrame:
         df = df_transactions.copy()
         costs = df_costs.copy()
 
+        # Limpieza inicial
         if 'price' in df.columns:
             df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0.0)
         else:
             df['price'] = 0.0
 
-        df['gross_weight'] = pd.to_numeric(df['gross_weight'], errors='coerce').fillna(0.0)
+        df['gross_weight'] = pd.to_numeric(df.get('gross_weight', 0), errors='coerce').fillna(0.0)
 
-        # 2. APLICAR REGLAS DE NEGOCIO (Antes de agrupar y validar)
+        # 2. APLICAR REGLAS DE NEGOCIO (Capex y Misceláneos)
         df = BusinessRulesEngine.apply_classification_rules(df)
 
+        # Validación de columnas obligatorias
         req_cols = ['reference', 'bu', 'gross_weight', 'transport_type']
         missing_cols = [col for col in req_cols if col not in df.columns]
         if missing_cols:
             raise ValueError(f"Faltan columnas canónicas: {missing_cols}")
 
         try:
-            # 1. Limpieza de Referencias con Regex y Fallback a BU
-            df['clean_key'] = df['reference'].apply(self._clean_ref)
-            
-            # Si la limpieza falló (None), usamos la BU como llave de cruce
-            df['clean_key'] = df['clean_key'].fillna(df['bu'])
+            # 3. DEFINICIÓN DE AGRUPACIÓN LOGÍSTICA (Contenedor vs Guía Terrestre)
+            if 'container_number' in df.columns:
+                # Si hay contenedor (SEA), limpiamos y agrupamos por contenedor. 
+                # Si una fila no trae contenedor, cae a la referencia (guía).
+                df['group_key'] = df['container_number'].fillna(df['reference']).apply(self._clean_ref)
+            else:
+                # Logística terrestre o aérea (Land/Outbound)
+                df['group_key'] = df['reference'].apply(self._clean_ref)
+                
+            # Si tanto contenedor como referencia fallan, usamos la BU como último recurso
+            df['group_key'] = df['group_key'].fillna(df['bu'])
 
-            # 2. Aplicar validadores de costos fijos y notas para cada transporte
-            df['fixed_cost'] = 0.0
+            # 4. PONDERACIÓN MATEMÁTICA
             df['note'] = ''
-            df.loc[df['gross_weight'] <= 0, 'note'] += 'Peso imputado; '
-            df.loc[df['price'] <= 0, 'note'] += 'Precio ausente; '
-
-            transport_norm = df['transport_type'].astype(str).str.strip().str.lower()
-            sea_missing_cost = (transport_norm == 'sea') & (df['gross_weight'] <= 0) & (df['price'] <= 0)
-            land_missing_cost = (transport_norm == 'land') & (df['gross_weight'] <= 0) & (df['price'] <= 0)
-            outbound_missing_cost = (transport_norm == 'outbound') & (df['gross_weight'] <= 0) & (df['price'] <= 0)
-
-            df.loc[sea_missing_cost, 'fixed_cost'] = 2500.0
-            df.loc[sea_missing_cost, 'note'] += 'Costo fijo SEA aplicado; '
-            df.loc[land_missing_cost, 'fixed_cost'] = 1800.0
-            df.loc[land_missing_cost, 'note'] += 'Costo fijo LAND aplicado; '
-            df.loc[outbound_missing_cost, 'fixed_cost'] = 2000.0
-            df.loc[outbound_missing_cost, 'note'] += 'Costo fijo OUTBOUND aplicado; '
-
-            # 3. Cálculo de Proporción (Usamos la llave limpia para agrupar)
             if self.allocation_type == 'weight':
-                allocation_weight = df['gross_weight'].where(~df['fixed_cost'].gt(0), 0).replace(0, 1)
-                total_weight_per_ref = allocation_weight.groupby(df['clean_key']).transform('sum')
-                df['Proportion'] = allocation_weight / total_weight_per_ref.replace(0, 1)
-            elif self.allocation_type == 'full_container':
-                items_per_ref = df.groupby('clean_key')['clean_key'].transform('count')
-                df['Proportion'] = 1.0 / items_per_ref
+                # Suma total del peso por Contenedor/Guía
+                total_weight_per_group = df.groupby('group_key')['gross_weight'].transform('sum')
+                
+                # Proporción = Peso Individual / Peso Total
+                df['Proportion'] = df['gross_weight'] / total_weight_per_group.replace(0, np.nan)
+                
+                # Manejo de nulos (Equivalente al IFERROR de tu Excel)
+                df['Proportion'] = df['Proportion'].fillna(1.0)
+            else:
+                items_per_group = df.groupby('group_key')['group_key'].transform('count')
+                df['Proportion'] = 1.0 / items_per_group
 
-            # 4. Detección Heurística de Costos en el archivo financiero
+            # 5. DETECCIÓN FINANCIERA (Archivo de Costos)
             ref_col_costs = [c for c in costs.columns if 'ref' in c.lower() or 'bu' in c.lower()][0]
             cost_cols = [c for c in costs.columns if 'cost' in c.lower() or 'amount' in c.lower() or 'usd' in c.lower()]
             cost_col = cost_cols[0] if cost_cols else costs.columns[-1]
 
-            costs_subset = costs[[ref_col_costs, cost_col]].rename(columns={ref_col_costs: 'clean_key', cost_col: 'Total Cost'})
+            costs_subset = costs[[ref_col_costs, cost_col]].rename(columns={ref_col_costs: 'financial_key', cost_col: 'Total Cost'})
             
-            # Limpiamos también las llaves en el archivo de costos para que coincidan
-            costs_subset['clean_key'] = costs_subset['clean_key'].apply(lambda x: self._clean_ref(x) if self._clean_ref(x) else str(x).strip().upper())
-            
-            costs_subset = costs_subset.groupby('clean_key', as_index=False)['Total Cost'].sum()
+            # Limpiamos las llaves financieras
+            costs_subset['financial_key'] = costs_subset['financial_key'].apply(lambda x: self._clean_ref(x) if self._clean_ref(x) else str(x).strip().upper())
+            costs_subset = costs_subset.groupby('financial_key', as_index=False)['Total Cost'].sum()
 
-            # JOIN Relacional usando la llave limpia (Referencia o BU)
-            df = df.merge(costs_subset, on='clean_key', how='left')
+            # 6. JOIN Relacional Operaciones <-> Finanzas
+            df = df.merge(costs_subset, left_on='group_key', right_on='financial_key', how='left')
+            
+            # 7. SISTEMA DE RESPALDO (Fallback Costs)
+            df['fixed_cost'] = 0.0 # Columna de rastreo para auditoría
+            
+            def apply_fallback(row):
+                if pd.isna(row['Total Cost']) or row['Total Cost'] == 0:
+                    trans_type = str(row['transport_type']).strip().lower()
+                    # Si no hay costo financiero, inyectamos la tarifa pactada (Ej. 2500 para Sea)
+                    fallback = self.fallback_costs.get(trans_type, 0.0)
+                    if fallback > 0:
+                        return fallback, fallback # Retornamos Costo Final, y Registro de Fallback
+                return row['Total Cost'], 0.0
+
+            # Aplicamos la función a dos columnas (Total Cost y fixed_cost)
+            df[['Total Cost', 'fixed_cost']] = df.apply(apply_fallback, axis=1, result_type='expand')
             df['Total Cost'] = pd.to_numeric(df['Total Cost'], errors='coerce').fillna(0)
+            
+            # Anotaciones para auditoría
+            df.loc[df['fixed_cost'] > 0, 'note'] += f'Costo estándar aplicado; '
+            df.loc[df['gross_weight'] <= 0, 'note'] += 'Peso imputado; '
 
-            # Gasto Calculado
+            # 8. CÁLCULO FINAL DE EXPENSAS
             df['Calc_Exp'] = df['Total Cost'] * df['Proportion']
-            df.loc[df['fixed_cost'] > 0, 'Calc_Exp'] = df.loc[df['fixed_cost'] > 0, 'fixed_cost']
 
-            #Agrupación Particionada
+            # 9. AGRUPACIÓN PARTICIONADA (Resumen Ejecutivo)
             group_cols = ['transport_type', 'bu']
             if 'method' in df.columns:
                 group_cols.insert(1, 'method')
-                # Llenamos nulos en method para evitar que groupby los ignore
                 df['method'] = df['method'].fillna('N/A')
 
             summary = df.groupby(group_cols, as_index=False).agg({
@@ -122,18 +145,19 @@ class CostAllocationEngine:
             total_exp_per_transport = summary.groupby('Transport')['Arg. Var $'].transform('sum')
             summary['%PCT'] = summary['Arg. Var $'] / total_exp_per_transport.replace(0, 1)
             
-            # --- NUEVA VALIDACIÓN DE CONCILIACIÓN ---
-            total_default_cost = df['fixed_cost'].sum()
+            # --- 10. MÉTRICAS DE CONCILIACIÓN ---
+            total_default_cost = df['fixed_cost'].drop_duplicates().sum() # Sumamos los respaldos aplicados
             total_input_cost = costs_subset['Total Cost'].sum() + total_default_cost
             total_allocated_cost = summary['Arg. Var $'].sum()
             diff = total_input_cost - total_allocated_cost
+            
             match_rate = 0.0
             if total_input_cost:
                 match_rate = max(0.0, 100.0 * (1 - abs(diff) / total_input_cost))
             
-            logger.info(f"AUDITORÍA: Total Facturado: {total_input_cost} | Total Asignado: {total_allocated_cost} | Diff: {diff}")
+            logger.info(f"AUDITORÍA: Facturado (Real+Fallback): {total_input_cost} | Asignado: {total_allocated_cost} | Diff: {diff}")
             
-            # Guardamos la métrica en el dataframe para que la UI pueda leerla
+            # Diccionario para UI
             summary.attrs['reconciliation'] = {
                 'total_facturado': total_input_cost,
                 'total_asignado': total_allocated_cost,
