@@ -30,34 +30,42 @@ logger = logging.getLogger(__name__)
 
 CACHE_FILENAME = "mapping_cache.json"
 
+import pandas as pd
+import streamlit as st
+
 def smart_read_excel(file_obj) -> pd.DataFrame:
     """
-    Lee un Excel escaneando las primeras 30 filas para saltar 
-    títulos y celdas combinadas, encontrando el encabezado real.
+    Lee un Excel en memoria saltando títulos y evitando errores de puntero.
     """
     try:
-        # Leemos las primeras 30 filas sin asignar encabezados
-        df_temp = smart_read_excel(file_obj)
+        # 1. CRÍTICO: Regresar el puntero del archivo de Streamlit al inicio
+        if hasattr(file_obj, 'seek'):
+            file_obj.seek(0)
+            
+        # 2. Cargar el archivo en el motor de Pandas UNA SOLA VEZ para evitar recursión
+        xls = pd.ExcelFile(file_obj)
+        
+        # 3. Leer la muestra de las primeras 30 filas
+        df_temp = pd.read_excel(xls, header=None, nrows=30)
         header_idx = 0
         
-        # Palabras clave que suelen estar en un encabezado logístico
-        keywords = ['REF', 'BU', 'PESO', 'WEIGHT', 'PART', 'ITEM', 'UNIT', 'GUIA', 'TRACKING', 'METHOD', 'CUSTOMER']
+        # Diccionario de palabras clave logísticas
+        keywords = ['REF', 'BU', 'PESO', 'WEIGHT', 'PART', 'ITEM', 'UNIT', 'GUIA', 'TRACKING', 'METHOD', 'CUSTOMER', 'WAYBILL']
         
         for idx, row in df_temp.iterrows():
             row_str = row.astype(str).str.upper().tolist()
-            # Si la fila contiene alguna de las palabras clave, esa es nuestra fila de encabezados
             if any(any(kw in cell for kw in keywords) for cell in row_str if cell != 'NAN'):
                 header_idx = idx
                 break
                 
-        # Ahora leemos el archivo completo empezando desde la fila correcta
-        df = smart_read_excel(file_obj)
+        # 4. Leer el DataFrame final desde la posición correcta usando el mismo archivo en memoria
+        df = pd.read_excel(xls, header=header_idx)
         df.columns = df.columns.astype(str).str.strip().str.upper()
         
         return df
+
     except Exception as e:
-        import streamlit as st
-        st.error(f"Error al leer el archivo: {e}")
+        st.error(f"Error técnico al leer el archivo: {e}")
         return pd.DataFrame()
 
 def get_cache_path() -> str:
