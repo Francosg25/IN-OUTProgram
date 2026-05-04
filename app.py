@@ -30,35 +30,43 @@ logger = logging.getLogger(__name__)
 
 CACHE_FILENAME = "mapping_cache.json"
 
-import pandas as pd
-import streamlit as st
+
 
 def smart_read_excel(file_obj) -> pd.DataFrame:
     """
-    Lee un Excel en memoria saltando títulos y evitando errores de puntero.
+    Lee un Excel en memoria saltando títulos, evitando errores de puntero 
+    y casteando tipos de celda de forma segura.
     """
     try:
-        # 1. CRÍTICO: Regresar el puntero del archivo de Streamlit al inicio
+        # 1. Regresar puntero
         if hasattr(file_obj, 'seek'):
             file_obj.seek(0)
             
-        # 2. Cargar el archivo en el motor de Pandas UNA SOLA VEZ para evitar recursión
         xls = pd.ExcelFile(file_obj)
-        
-        # 3. Leer la muestra de las primeras 30 filas
         df_temp = pd.read_excel(xls, header=None, nrows=30)
         header_idx = 0
         
-        # Diccionario de palabras clave logísticas
         keywords = ['REF', 'BU', 'PESO', 'WEIGHT', 'PART', 'ITEM', 'UNIT', 'GUIA', 'TRACKING', 'METHOD', 'CUSTOMER', 'WAYBILL']
         
+        # 2. Escáner Seguro Celda por Celda
         for idx, row in df_temp.iterrows():
-            row_str = row.astype(str).str.upper().tolist()
-            if any(any(kw in cell for kw in keywords) for cell in row_str if cell != 'NAN'):
+            row_list = row.tolist()
+            contains_keyword = False
+            
+            for cell in row_list:
+                # Solo evaluamos la celda si no es nula/vacía
+                if pd.notna(cell):
+                    # Forzamos la conversión a texto puro (Safe Cast)
+                    cell_str = str(cell).upper().strip()
+                    if any(kw in cell_str for kw in keywords):
+                        contains_keyword = True
+                        break # Encontramos la fila de encabezados
+            
+            if contains_keyword:
                 header_idx = idx
                 break
                 
-        # 4. Leer el DataFrame final desde la posición correcta usando el mismo archivo en memoria
+        # 3. Lectura final desde la fila detectada
         df = pd.read_excel(xls, header=header_idx)
         df.columns = df.columns.astype(str).str.strip().str.upper()
         
