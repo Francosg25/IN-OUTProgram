@@ -412,7 +412,7 @@ def main():
                 return
 
             if isinstance(cost_file, BytesIO) or hasattr(cost_file, 'name') and cost_file.name.lower().endswith('.csv'):
-                df_costs = pd.read_csv(cost_file)
+                df_costs = pd.read_csv(cost_file, encoding='latin1')
             else:
                 df_costs = smart_read_excel(cost_file)
             
