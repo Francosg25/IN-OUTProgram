@@ -30,6 +30,36 @@ logger = logging.getLogger(__name__)
 
 CACHE_FILENAME = "mapping_cache.json"
 
+def smart_read_excel(file_obj) -> pd.DataFrame:
+    """
+    Lee un Excel escaneando las primeras 30 filas para saltar 
+    títulos y celdas combinadas, encontrando el encabezado real.
+    """
+    try:
+        # Leemos las primeras 30 filas sin asignar encabezados
+        df_temp = smart_read_excel(file_obj, header=None, nrows=30)
+        header_idx = 0
+        
+        # Palabras clave que suelen estar en un encabezado logístico
+        keywords = ['REF', 'BU', 'PESO', 'WEIGHT', 'PART', 'ITEM', 'UNIT', 'GUIA', 'TRACKING', 'METHOD', 'CUSTOMER']
+        
+        for idx, row in df_temp.iterrows():
+            row_str = row.astype(str).str.upper().tolist()
+            # Si la fila contiene alguna de las palabras clave, esa es nuestra fila de encabezados
+            if any(any(kw in cell for kw in keywords) for cell in row_str if cell != 'NAN'):
+                header_idx = idx
+                break
+                
+        # Ahora leemos el archivo completo empezando desde la fila correcta
+        df = smart_read_excel(file_obj, header=header_idx)
+        df.columns = df.columns.astype(str).str.strip().str.upper()
+        
+        return df
+    except Exception as e:
+        import streamlit as st
+        st.error(f"Error al leer el archivo: {e}")
+        return pd.DataFrame()
+
 def get_cache_path() -> str:
     return os.path.join(os.path.dirname(__file__), CACHE_FILENAME)
 
@@ -206,13 +236,10 @@ def main():
     if "mapping_cache" not in st.session_state:
         st.session_state.mapping_cache = mapping_cache
 
-    # 3. PANEL DE MAPEO DINÁMICO
-    st.markdown("Mapeo de Columnas")
-    st.caption("Selecciona qué columna de tu Excel corresponde a cada dato necesario. El Peso Bruto y el Precio son opcionales; si un contenedor SEA no tiene ninguno de los dos, se le asigna un costo predeterminado de 2500 pesos.")
-    
+   
     def create_mapping_ui(file, label):
         if file:
-            df = pd.read_excel(file)
+            df = smart_read_excel(file)
             suggested = suggest_mapping(df)
             saved = st.session_state.mapping_cache.get(label, {})
             cols = [""] + df.columns.tolist()
@@ -287,7 +314,7 @@ def main():
             if isinstance(cost_file, BytesIO) or hasattr(cost_file, 'name') and cost_file.name.lower().endswith('.csv'):
                 df_costs = pd.read_csv(cost_file)
             else:
-                df_costs = pd.read_excel(cost_file)
+                df_costs = smart_read_excel(cost_file)
             
             with st.spinner("Procesando datos y aplicando reglas de negocio..."):
                 unified = pd.concat(to_process, ignore_index=True)
@@ -312,7 +339,7 @@ def main():
 
                 pct_tab, mon_tab = build_executive_tables(final_summary)
                 
-                t1, t2 = st.tabs(["📊 Reporte Ejecutivo", "🔍 Auditoría Detallada"])
+                t1, t2 = st.tabs(["Reporte Ejecutivo", "Auditoría Detallada"])
                 with t1:
                     st.write("### Summary final por BU y Tipo de Viaje")
                     st.dataframe(summary_report.style.format({"%PCT": "{:.1%}", "Arg. Var $": "${:,.0f}"}), use_container_width=True)
@@ -322,7 +349,7 @@ def main():
                     st.dataframe(mon_tab.style.format("${:,.0f}"), use_container_width=True)
                     
                     st.download_button(
-                        "📥 Descargar Resumen Final (CSV)",
+                        "Descargar Resumen Final (CSV)",
                         summary_report.to_csv(index=False),
                         "auditoria_logistica_summary.csv",
                         "text/csv"
