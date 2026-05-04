@@ -1,34 +1,31 @@
 import pandas as pd
 
-def check_not_null(df, col):
-    return df[col].notnull(), f"Campo {col} es obligatorio"
-
-def check_range(df, col, min_val, max_val):
-    return df[col].between(min_val, max_val), f"{col} fuera de rango ({min_val}-{max_val})"
-
-def check_regex(df, col, pattern):
-    return df[col].astype(str).str.match(pattern), f"Formato inválido en {col}"
-
-def validate_range(df: pd.DataFrame, col: str, min_val: float, max_val: float):
-    mask = df[col].between(min_val, max_val)
-    return mask, f"Valor fuera de rango ({min_val} - {max_val})"
-
-def validate_regex(df: pd.DataFrame, col: str, pattern: str):
-    mask = df[col].astype(str).str.match(pattern, na=False)
-    return mask, f"No cumple con el formato requerido"
-
-def validate_not_null(df: pd.DataFrame, col: str):
-    mask = df[col].notnull()
-    return mask, "Este campo es obligatorio"
-
-VALIDATION_CONFIG = {
-    "Ventas": [
-        {"func": check_not_null, "args": ["ID_Transaccion"]},
-        {"func": check_range, "args": ["Monto", 0, 1000000]},
-    ],
-    "Inventario": [
-        {"func": check_regex, "args": ["SKU", r"^[A-Z]{3}-\d+$"]},
-    ]
-}
-
-
+class BusinessRulesEngine:
+    """
+    Motor de reglas de negocio para clasificar Unidades de Negocio (BUs)
+    basado en la semántica de los Números de Parte.
+    """
+    @staticmethod
+    def apply_classification_rules(df: pd.DataFrame) -> pd.DataFrame:
+        if 'part_number' not in df.columns or 'bu' not in df.columns:
+            return df
+            
+        df_rules = df.copy()
+        
+        def classify_part(row):
+            part = str(row['part_number']).upper().strip()
+            current_bu = str(row['bu']).strip()
+            
+            # REGLA CAPEX
+            if 'CAPEX' in part or (part.isalpha() and len(part) > 3 and 'TAPA' not in part and 'CAJA' not in part):
+                return 'Capex'
+                
+            # REGLA MISCELÁNEOS
+            misc_keywords = ['TAPA', 'CAJA', 'BASE', 'CHAROLA', 'PALLET', 'CARTON', 'PLASTICA', 'PLASTICO', 'WOOD']
+            if any(kw in part for kw in misc_keywords) or part.count(' ') >= 3:
+                return 'Miscelaneus'
+                
+            return current_bu
+            
+        df_rules['bu'] = df_rules.apply(classify_part, axis=1)
+        return df_rules

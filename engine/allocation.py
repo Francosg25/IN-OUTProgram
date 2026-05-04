@@ -27,7 +27,6 @@ class CostAllocationEngine:
         df = df_transactions.copy()
         costs = df_costs.copy()
 
-        # Price is optional but gross_weight must exist for the engine logic.
         if 'price' in df.columns:
             df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0.0)
         else:
@@ -35,8 +34,10 @@ class CostAllocationEngine:
 
         df['gross_weight'] = pd.to_numeric(df['gross_weight'], errors='coerce').fillna(0.0)
 
+        # 2. APLICAR REGLAS DE NEGOCIO (Antes de agrupar y validar)
+        df = BusinessRulesEngine.apply_classification_rules(df)
+
         req_cols = ['reference', 'bu', 'gross_weight', 'transport_type']
-        
         missing_cols = [col for col in req_cols if col not in df.columns]
         if missing_cols:
             raise ValueError(f"Faltan columnas canónicas: {missing_cols}")

@@ -239,18 +239,19 @@ def main():
                 default_bu = saved.get('bu') or suggested.get('bu')
                 default_w = saved.get('gross_weight') or suggested.get('gross_weight')
                 default_price = saved.get('price') or suggested.get('price')
+                default_part = saved.get('part_number') or suggested.get('part_number')
 
                 m_ref = select_with_default(f"Referencia / Guía ({label})", f"sel_ref_{label}", default_ref)
                 m_bu = select_with_default(f"Unidad de Negocio ({label})", f"sel_bu_{label}", default_bu)
                 m_w = select_with_default(f"Peso Bruto ({label}) - Opcional", f"sel_w_{label}", default_w)
                 m_price = select_with_default(f"Precio / Valor ({label}) - Opcional", f"sel_price_{label}", default_price)
+                m_part = select_with_default(f"Número de Parte ({label}) - Opcional", f"sel_part_{label}", default_part)
 
                 if m_ref and m_bu:
                     mapping = {"reference": m_ref, "bu": m_bu}
-                    if m_w:
-                        mapping["gross_weight"] = m_w
-                    if m_price:
-                        mapping["price"] = m_price
+                    if m_w: mapping["gross_weight"] = m_w
+                    if m_price: mapping["price"] = m_price
+                    if m_part: mapping["part_number"] = m_part # Guarda el mapeo del no. de parte
                     st.session_state.mapping_cache[label] = mapping
                     return df, mapping
                 else:
