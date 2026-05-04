@@ -21,7 +21,6 @@ def validate_not_null(df: pd.DataFrame, col: str):
     mask = df[col].notnull()
     return mask, "Este campo es obligatorio"
 
-# Diccionario maestro de validaciones (Aquí irían tus cientos de reglas)
 VALIDATION_CONFIG = {
     "Ventas": [
         {"func": check_not_null, "args": ["ID_Transaccion"]},

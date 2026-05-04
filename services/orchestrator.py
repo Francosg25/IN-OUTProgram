@@ -7,8 +7,8 @@ logger = logging.getLogger(__name__)
 
 class LogisticsPipelineOrchestrator:
     def __init__(self, allocation_engine):
-        self.allocation_engine = allocation_engine
-        
+        self.allocation_engine = allocation_engin
+          
         self.aliases = {
             'reference': ['REFERENCE', 'CONTAINER NUMBER', 'WAYBILL NUMBER', 'REFERENCIA', 'CONTAINER'],
             'bu': ['BU', 'OU', 'BUSINESS UNIT', 'UNIDAD DE NEGOCIO'],
