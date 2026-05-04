@@ -43,7 +43,7 @@ def smart_read_excel(file_obj) -> pd.DataFrame:
         if hasattr(file_obj, 'seek'):
             file_obj.seek(0)
             
-        xls = pd.ExcelFile(file_obj)
+        xls = pd.ExcelFile(file_obj, engine='openpyxl')
         df_temp = pd.read_excel(xls, header=None, nrows=30)
         header_idx = 0
         
