@@ -37,7 +37,7 @@ def smart_read_excel(file_obj) -> pd.DataFrame:
     """
     try:
         # Leemos las primeras 30 filas sin asignar encabezados
-        df_temp = smart_read_excel(file_obj, header=None, nrows=30)
+        df_temp = smart_read_excel(file_obj, nrows=30)
         header_idx = 0
         
         # Palabras clave que suelen estar en un encabezado logístico
@@ -51,7 +51,7 @@ def smart_read_excel(file_obj) -> pd.DataFrame:
                 break
                 
         # Ahora leemos el archivo completo empezando desde la fila correcta
-        df = smart_read_excel(file_obj, header=header_idx)
+        df = smart_read_excel(file_obj)
         df.columns = df.columns.astype(str).str.strip().str.upper()
         
         return df
@@ -90,26 +90,59 @@ def normalize_col_name(name: str) -> str:
     return re.sub(r'[\W_]+', '', str(name).strip().lower())
 
 
-def find_best_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    normalized_candidates = [normalize_col_name(c) for c in candidates]
-    for col in df.columns:
-        col_norm = normalize_col_name(col)
-        if col_norm in normalized_candidates:
+dimport re
+
+def find_best_column(columns_list: list, keywords: list) -> str:
+    """
+    Escáner heurístico avanzado. Prioriza coincidencias exactas, 
+    luego palabras completas (Regex) y finalmente coincidencias parciales.
+    """
+    if not columns_list:
+        return None
+
+    # 1. MATCH EXACTO (Prioridad Máxima)
+    # Ejemplo: Si la columna se llama exactamente "BU"
+    for col in columns_list:
+        col_clean = str(col).strip().upper()
+        if col_clean in [k.upper() for k in keywords]:
             return col
-    for col in df.columns:
-        col_norm = normalize_col_name(col)
-        for candidate_norm in normalized_candidates:
-            if candidate_norm in col_norm or col_norm in candidate_norm:
+
+    # 2. MATCH DE PALABRA COMPLETA (Word Boundaries)
+    # Ejemplo: "BU DESTINO" hace match con "BU", pero "BULTOS" es ignorado.
+    for col in columns_list:
+        col_clean = str(col).strip().upper()
+        for kw in keywords:
+            kw_upper = kw.upper()
+            # \b indica un límite de palabra (espacios, guiones, inicio/fin)
+            if re.search(rf'\b{kw_upper}\b', col_clean):
                 return col
+
+    # 3. MATCH PARCIAL (Fallback de rescate)
+    # Ejemplo: "PESO_BRUTO" hace match con "PESO"
+    for col in columns_list:
+        col_clean = str(col).strip().upper()
+        for kw in keywords:
+            kw_upper = kw.upper()
+            if kw_upper in col_clean:
+                # Regla de Excepción Crítica para Logística
+                if kw_upper == 'BU' and 'BULTO' in col_clean:
+                    continue # Ignoramos "BULTOS" para que no se asigne a "BU"
+                return col
+                
     return None
 
-
-def suggest_mapping(df: pd.DataFrame) -> Dict[str, Optional[str]]:
+def suggest_mapping(df: pd.DataFrame) -> dict:
+    """
+    Genera sugerencias de mapeo usando el escáner heurístico.
+    """
+    cols = df.columns.tolist()
     return {
-        'reference': find_best_column(df, ['reference', 'ref', 'guia', 'guía', 'documento', 'doc', 'tracking', 'awb']),
-        'bu': find_best_column(df, ['bu', 'unidad de negocio', 'unidad', 'business unit', 'businessunit', 'area', 'division']),
-        'gross_weight': find_best_column(df, ['gross_weight', 'peso', 'weight', 'kg', 'kgs']),
-        'price': find_best_column(df, ['price', 'precio', 'cost', 'valor', 'amount', 'monto'])
+        'reference': find_best_column(cols, ['reference', 'ref', 'guia', 'guía', 'documento', 'doc', 'tracking', 'awb', 'waybill']),
+        'bu': find_best_column(cols, ['bu', 'unidad de negocio', 'unidad', 'business unit', 'businessunit', 'area', 'division']),
+        'gross_weight': find_best_column(cols, ['gross_weight', 'peso', 'weight', 'kg', 'kgs']),
+        'price': find_best_column(cols, ['price', 'precio', 'cost', 'valor', 'amount', 'monto']),
+        # ¡Añadimos la columna del número de parte para que funcione el motor de reglas (Capex/Misc)!
+        'part_number': find_best_column(cols, ['part_number', 'part number', 'numero de parte', 'no. parte', 'item', 'item code'])
     }
 
 class LogisticsOrchestrator:
