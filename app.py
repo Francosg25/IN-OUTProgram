@@ -90,7 +90,6 @@ def normalize_col_name(name: str) -> str:
     return re.sub(r'[\W_]+', '', str(name).strip().lower())
 
 
-dimport re
 
 def find_best_column(columns_list: list, keywords: list) -> str:
     """
