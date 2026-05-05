@@ -33,43 +33,64 @@ CACHE_FILENAME = "mapping_cache.json"
 
 
 
+import pandas as pd
+import streamlit as st
+
+import pandas as pd
+import streamlit as st
+
 def smart_read_excel(file_obj) -> pd.DataFrame:
     """
-    Lee un Excel en memoria saltando títulos, evitando errores de puntero 
-    y casteando tipos de celda de forma segura.
+    Escáner de densidad heurística con consolidación automática de columnas divididas (Ej. Múltiples Gross Weights).
     """
     try:
-        # 1. Regresar puntero
         if hasattr(file_obj, 'seek'):
             file_obj.seek(0)
             
         xls = pd.ExcelFile(file_obj, engine='openpyxl')
         df_temp = pd.read_excel(xls, header=None, nrows=30)
-        header_idx = 0
         
-        keywords = ['REF', 'BU', 'PESO', 'WEIGHT', 'PART', 'ITEM', 'UNIT', 'GUIA', 'TRACKING', 'METHOD', 'CUSTOMER', 'WAYBILL']
+        # Diccionario expandido para asegurar que atrapa la tabla real en cualquier formato
+        keywords = ['REF', 'REFERENCE', 'GUIA', 'WAYBILL', 'AWB', 'TRACKING', 
+                    'BU', 'BUSINESS UNIT', 'UNIDAD', 
+                    'PESO', 'WEIGHT', 'KGS', 'LBS', 'GROSS', 
+                    'PART', 'ITEM', 'QTY', 'PIECES', 'BULTOS', 
+                    'CONTAINER', 'CONTENEDOR', 'CNTR', 'EQUIPO', 
+                    'COST', 'PRICE', 'AMOUNT', 'USD', 'FIX COST']
         
-        # 2. Escáner Seguro Celda por Celda
+        best_idx = 0
+        max_score = -1
+        
         for idx, row in df_temp.iterrows():
             row_list = row.tolist()
-            contains_keyword = False
-            
+            score = 0
+            non_null_count = 0
             for cell in row_list:
-                # Solo evaluamos la celda si no es nula/vacía
-                if pd.notna(cell):
-                    # Forzamos la conversión a texto puro (Safe Cast)
+                if pd.notna(cell) and str(cell).strip() != "":
+                    non_null_count += 1 
                     cell_str = str(cell).upper().strip()
                     if any(kw in cell_str for kw in keywords):
-                        contains_keyword = True
-                        break # Encontramos la fila de encabezados
-            
-            if contains_keyword:
-                header_idx = idx
-                break
+                        score += 10 
+                        
+            total_score = score + non_null_count
+            if total_score > max_score:
+                max_score = total_score
+                best_idx = idx
                 
-        # 3. Lectura final desde la fila detectada
-        df = pd.read_excel(xls, header=header_idx)
+        df = pd.read_excel(xls, header=best_idx)
         df.columns = df.columns.astype(str).str.strip().str.upper()
+        
+        # Buscar todas las columnas que hablen de peso bruto
+        peso_cols = [col for col in df.columns if 'GROSS WEIGHT' in col or 'PESO BRUTO' in col]
+        
+        if len(peso_cols) > 0:
+            # Sumar horizontalmente todas las columnas de peso encontradas
+            df['CONSOLIDATED_GROSS_WEIGHT'] = pd.to_numeric(df[peso_cols[0]], errors='coerce').fillna(0)
+            for col in peso_cols[1:]:
+                df['CONSOLIDATED_GROSS_WEIGHT'] += pd.to_numeric(df[col], errors='coerce').fillna(0)
+                
+            # Ocultamos las columnas sueltas para no confundir al usuario
+            df.drop(columns=peso_cols, inplace=True)
         
         return df
 
@@ -144,6 +165,38 @@ def normalize_col_name(name: str) -> str:
     return re.sub(r'[\W_]+', '', str(name).strip().lower())
 
 
+def numeric_column_score(series: pd.Series) -> float:
+    cleaned = series.astype(str).str.replace(r'[^0-9\-\.,]', '', regex=True).str.replace(',', '.')
+    numeric = pd.to_numeric(cleaned, errors='coerce')
+    valid = numeric.notna() & (numeric > 0)
+    if len(series) == 0:
+        return 0.0
+    return valid.sum() / len(series)
+
+
+def textual_column_score(series: pd.Series) -> float:
+    text = series.astype(str).str.strip()
+    non_empty = text[text != '']
+    if len(non_empty) == 0:
+        return 0.0
+    numeric_like = non_empty.str.match(r'^[0-9\.,\-]+$').sum()
+    if numeric_like / len(non_empty) > 0.5:
+        return 0.0
+    unique_ratio = non_empty.nunique() / len(non_empty)
+    return min(1.0, max(0.3, unique_ratio))
+
+
+def reference_column_score(series: pd.Series) -> float:
+    text = series.astype(str).str.strip()
+    non_empty = text[text != '']
+    if len(non_empty) == 0:
+        return 0.0
+    has_letters = non_empty.str.contains(r'[A-Za-z]').mean()
+    has_digits = non_empty.str.contains(r'\d').mean()
+    unique_ratio = non_empty.nunique() / len(non_empty)
+    return min(1.0, has_letters * 0.5 + has_digits * 0.3 + unique_ratio * 0.2)
+
+
 def fuzzy_match_column(columns_list: list, keywords: list) -> Optional[str]:
     if not columns_list:
         return None
@@ -197,17 +250,50 @@ def find_best_column(columns_list: list, keywords: list) -> Optional[str]:
     return fuzzy_match_column(columns_list, keywords)
 
 
+def detect_fallback_column(df: pd.DataFrame, field_name: str) -> Optional[str]:
+    if field_name in ('gross_weight', 'price'):
+        best = None
+        best_score = 0.0
+        for col in df.columns:
+            score = numeric_column_score(df[col])
+            if score > best_score:
+                best_score = score
+                best = col
+        return best if best_score >= 0.65 else None
+
+    if field_name == 'bu':
+        best = None
+        best_score = 0.0
+        for col in df.columns:
+            score = textual_column_score(df[col])
+            if score > best_score:
+                best_score = score
+                best = col
+        return best if best_score >= 0.5 else None
+
+    if field_name == 'reference':
+        best = None
+        best_score = 0.0
+        for col in df.columns:
+            score = reference_column_score(df[col])
+            if score > best_score:
+                best_score = score
+                best = col
+        return best if best_score >= 0.4 else None
+
+    return None
+
+
 def suggest_mapping(df: pd.DataFrame, label: str) -> dict:
     cols = df.columns.tolist()
     aliases = TRAVEL_COLUMN_ALIASES.get(label, GENERIC_COLUMN_ALIASES)
-    return {
-        'reference': find_best_column(cols, aliases.get('reference', GENERIC_COLUMN_ALIASES['reference'])),
-        'container_number': find_best_column(cols, aliases.get('container_number', GENERIC_COLUMN_ALIASES['container_number'])),
-        'bu': find_best_column(cols, aliases.get('bu', GENERIC_COLUMN_ALIASES['bu'])),
-        'gross_weight': find_best_column(cols, aliases.get('gross_weight', GENERIC_COLUMN_ALIASES['gross_weight'])),
-        'price': find_best_column(cols, aliases.get('price', GENERIC_COLUMN_ALIASES['price'])),
-        'part_number': find_best_column(cols, aliases.get('part_number', GENERIC_COLUMN_ALIASES['part_number']))
-    }
+    mapping = {}
+    for field in ['reference', 'container_number', 'bu', 'gross_weight', 'price', 'part_number']:
+        candidate = find_best_column(cols, aliases.get(field, GENERIC_COLUMN_ALIASES[field]))
+        if not candidate:
+            candidate = detect_fallback_column(df, field)
+        mapping[field] = candidate
+    return mapping
 
 class LogisticsOrchestrator:
     """
@@ -278,7 +364,7 @@ class LogisticsOrchestrator:
         return self.allocation_engine.calculate_outbound(unified, df_costs)
 
 def build_executive_tables(flat_summary: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Transforma el resumen plano en vistas ejecutivas pivotadas."""
+    """Transforma el resumen plano en vistas ejecutivas pivotadas (Formato Johnson Electric)."""
     if flat_summary.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -294,6 +380,7 @@ def build_executive_tables(flat_summary: pd.DataFrame) -> Tuple[pd.DataFrame, pd
         fill_value=0
     )
     pct_pivot.index = pct_pivot.index + ' %PCT'
+    pct_pivot.index.name = 'Type' # Coincide con la imagen
 
     # Tabla Monetaria
     mon_pivot = df_c.pivot_table(
@@ -303,16 +390,18 @@ def build_executive_tables(flat_summary: pd.DataFrame) -> Tuple[pd.DataFrame, pd
         aggfunc='sum', 
         fill_value=0
     )
-    mon_pivot.insert(0, 'Total Arg. Var $', mon_pivot.sum(axis=1))
+    # Insertar total con el nombre exacto de la imagen
+    mon_pivot.insert(0, 'Arg. Var $', mon_pivot.sum(axis=1))
+    mon_pivot.index.name = 'Viewer' # Coincide con la imagen
 
     return pct_pivot, mon_pivot
 
 def main():
-    st.set_page_config(page_title="Logistics Auditor PRO", layout="wide", page_icon="🚢")
+    st.set_page_config(page_title="Sistema de cuentas", layout="wide", page_icon="")
     st.title("Sistema logistico ")
     st.markdown("""
     Esta herramienta permite cargar reportes logísticos con cualquier estructura y asignar sus costos 
-    mediante un mapeo manual de columnas.
+    con detección automática de columnas según el tipo de viaje.
     """)
     st.divider()
 
@@ -330,6 +419,11 @@ def main():
     with c_out: out_file = st.file_uploader("Outbound / Export", type=["xlsx"], key="u_out")
 
     mapping_cache = load_mapping_cache()
+    if "mapping_cache" not in st.session_state:
+        st.session_state.mapping_cache = mapping_cache
+
+    st.markdown("Mapeo de Columnas")
+    st.caption("El sistema detecta automáticamente las columnas más probables según el tipo de viaje. Corrige sólo aquellas que no se identifiquen con precisión.")
     if "mapping_cache" not in st.session_state:
         st.session_state.mapping_cache = mapping_cache
 
@@ -448,11 +542,21 @@ def main():
                     st.write("**Distribución Monetaria ($)**")
                     st.dataframe(mon_tab.style.format("${:,.0f}"), use_container_width=True)
                     
+                    buffer = BytesIO()
+                    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                        # Escribir tabla de porcentajes arriba
+                        pct_tab.to_excel(writer, sheet_name='Reporte', startrow=0)
+                        # Escribir tabla de dinero abajo (dejando un espacio de 2 filas)
+                        mon_tab.to_excel(writer, sheet_name='Reporte', startrow=len(pct_tab) + 2)
+                        # Pestaña de respaldo
+                        final_summary.to_excel(writer, sheet_name='Base de Datos (Auditoría)', index=False)
+                    
                     st.download_button(
-                        "Descargar Resumen Final (CSV)",
-                        summary_report.to_csv(index=False),
-                        "auditoria_logistica_summary.csv",
-                        "text/csv"
+                        label="📥 Descargar Reporte en Excel",
+                        data=buffer.getvalue(),
+                        file_name="Consolidado_Logistico_IN_OUT.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary"
                     )
                 
                 with t2:
