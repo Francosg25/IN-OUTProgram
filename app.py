@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Dict, Any, Literal, List, Optional, Tuple
 from io import BytesIO
 
-# Importación del motor matemático
 try:
     from engine.allocation import CostAllocationEngine
 except ImportError:
@@ -32,25 +31,17 @@ logger = logging.getLogger(__name__)
 CACHE_FILENAME = "mapping_cache.json"
 
 
-
-import pandas as pd
-import streamlit as st
-
-import pandas as pd
-import streamlit as st
-
 def smart_read_excel(file_obj) -> pd.DataFrame:
     """
-    Escáner de densidad heurística con consolidación automática de columnas divididas (Ej. Múltiples Gross Weights).
+    Escáner de densidad heurística Multi-Hoja con consolidación automática de columnas.
     """
     try:
         if hasattr(file_obj, 'seek'):
             file_obj.seek(0)
             
         xls = pd.ExcelFile(file_obj, engine='openpyxl')
-        df_temp = pd.read_excel(xls, header=None, nrows=30)
         
-        # Diccionario expandido para asegurar que atrapa la tabla real en cualquier formato
+        # Diccionario expandido
         keywords = ['REF', 'REFERENCE', 'GUIA', 'WAYBILL', 'AWB', 'TRACKING', 
                     'BU', 'BUSINESS UNIT', 'UNIDAD', 
                     'PESO', 'WEIGHT', 'KGS', 'LBS', 'GROSS', 
@@ -58,39 +49,45 @@ def smart_read_excel(file_obj) -> pd.DataFrame:
                     'CONTAINER', 'CONTENEDOR', 'CNTR', 'EQUIPO', 
                     'COST', 'PRICE', 'AMOUNT', 'USD', 'FIX COST']
         
+        global_max_score = -1
+        best_sheet = None
         best_idx = 0
-        max_score = -1
         
-        for idx, row in df_temp.iterrows():
-            row_list = row.tolist()
-            score = 0
-            non_null_count = 0
-            for cell in row_list:
-                if pd.notna(cell) and str(cell).strip() != "":
-                    non_null_count += 1 
-                    cell_str = str(cell).upper().strip()
-                    if any(kw in cell_str for kw in keywords):
-                        score += 10 
-                        
-            total_score = score + non_null_count
-            if total_score > max_score:
-                max_score = total_score
-                best_idx = idx
-                
-        df = pd.read_excel(xls, header=best_idx)
+        # 1. ESCÁNER MULTI-HOJA
+        for sheet in xls.sheet_names:
+            df_temp = pd.read_excel(xls, sheet_name=sheet, header=None, nrows=30)
+            
+            for idx, row in df_temp.iterrows():
+                row_list = row.tolist()
+                score = 0
+                non_null_count = 0
+                for cell in row_list:
+                    if pd.notna(cell) and str(cell).strip() != "":
+                        non_null_count += 1 
+                        cell_str = str(cell).upper().strip()
+                        if any(kw in cell_str for kw in keywords):
+                            score += 10 
+                            
+                total_score = score + non_null_count
+                if total_score > global_max_score:
+                    global_max_score = total_score
+                    best_idx = idx
+                    best_sheet = sheet
+                    
+        # 2. LECTURA DE LA PESTAÑA GANADORA
+        df = pd.read_excel(xls, sheet_name=best_sheet, header=best_idx)
         df.columns = df.columns.astype(str).str.strip().str.upper()
         
-        # Buscar todas las columnas que hablen de peso bruto
+        # 3. CONSOLIDADOR INTELIGENTE DE PESOS MULTIPLES
         peso_cols = [col for col in df.columns if 'GROSS WEIGHT' in col or 'PESO BRUTO' in col]
         
         if len(peso_cols) > 0:
-            # Sumar horizontalmente todas las columnas de peso encontradas
             df['CONSOLIDATED_GROSS_WEIGHT'] = pd.to_numeric(df[peso_cols[0]], errors='coerce').fillna(0)
             for col in peso_cols[1:]:
                 df['CONSOLIDATED_GROSS_WEIGHT'] += pd.to_numeric(df[col], errors='coerce').fillna(0)
                 
-            # Ocultamos las columnas sueltas para no confundir al usuario
             df.drop(columns=peso_cols, inplace=True)
+            df.rename(columns={'CONSOLIDATED_GROSS_WEIGHT': 'GROSS_WEIGHT'}, inplace=True)
         
         return df
 
@@ -505,7 +502,8 @@ def main():
                 st.warning("No hay fuentes operativas configuradas correctamente.")
                 return
 
-            if isinstance(cost_file, BytesIO) or hasattr(cost_file, 'name') and cost_file.name.lower().endswith('.csv'):
+            if hasattr(cost_file, 'name') and cost_file.name.lower().endswith('.csv'):
+                # Si el archivo se llama explícitamente .csv
                 df_costs = pd.read_csv(cost_file, encoding='latin1')
             else:
                 df_costs = smart_read_excel(cost_file)
