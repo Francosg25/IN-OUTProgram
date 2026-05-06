@@ -140,7 +140,7 @@ TRAVEL_COLUMN_ALIASES = {
     'Sea': {
         'reference': ['reference', 'ref', 'guia', 'guía', 'awb', 'booking', 'shipment', 'documento'],
         'container_number': ['container', 'contenedor', 'cntr', 'box', 'equipo'],
-        'bu': ['bu', 'ou', 'business unit', 'unidad de negocio', 'unidad', 'area', 'division'],
+        'bu': ['bu', 'BU', 'ou', 'business unit', 'unidad de negocio', 'unidad', 'area', 'division', 'empresa', 'departamento', 'department', 'depto', 'unit'],
         'gross_weight': ['gross_weight', 'peso', 'weight', 'kg', 'kgs', 'peso bruto'],
         'price': ['price', 'precio', 'cost', 'valor', 'amount', 'monto'],
         'part_number': ['part_number', 'part number', 'numero de parte', 'item', 'item code']
@@ -148,7 +148,7 @@ TRAVEL_COLUMN_ALIASES = {
     'Land': {
         'reference': ['reference', 'ref', 'doc', 'documento', 'orden', 'guia', 'guía'],
         'container_number': ['container', 'contenedor', 'truck', 'camion', 'vehiculo'],
-        'bu': ['bu', 'ou', 'business unit', 'unidad de negocio'],
+        'bu': ['bu', 'BU', 'ou', 'business unit', 'unidad de negocio', 'unidad', 'area', 'division', 'empresa', 'departamento', 'department', 'depto', 'unit'],
         'gross_weight': ['gross_weight', 'peso', 'weight', 'kg', 'kgs', 'peso bruto'],
         'price': ['price', 'precio', 'cost', 'valor', 'amount', 'monto'],
         'part_number': ['part_number', 'part number', 'numero de parte', 'item', 'item code']
@@ -156,7 +156,7 @@ TRAVEL_COLUMN_ALIASES = {
     'Outbound': {
         'reference': ['reference', 'ref', 'shipment', 'export', 'tracking', 'documento', 'awb'],
         'container_number': ['container', 'contenedor', 'cntr', 'box', 'equipo'],
-        'bu': ['bu', 'ou', 'business unit', 'unidad de negocio', 'unidad', 'empresa', 'division'],
+        'bu': ['bu', 'BU', 'ou', 'business unit', 'unidad de negocio', 'unidad', 'empresa', 'division'],
         'gross_weight': ['gross_weight', 'peso', 'weight', 'kg', 'kgs', 'peso bruto'],
         'price': ['price', 'precio', 'cost', 'valor', 'amount', 'monto'],
         'part_number': ['part_number', 'part number', 'numero de parte', 'item', 'item code']
@@ -166,7 +166,7 @@ TRAVEL_COLUMN_ALIASES = {
 GENERIC_COLUMN_ALIASES = {
     'reference': ['reference', 'ref', 'guia', 'guía', 'documento', 'doc', 'tracking', 'awb', 'waybill'],
     'container_number': ['container', 'contenedor', 'cntr', 'box', 'equipo'],
-    'bu': ['bu', 'ou', 'business unit', 'unidad de negocio'],
+    'bu': ['bu', 'BU', 'ou', 'business unit', 'unidad de negocio'],
     'gross_weight': ['gross_weight', 'peso', 'weight', 'kg', 'kgs', 'peso bruto'],
     'price': ['price', 'precio', 'cost', 'valor', 'amount', 'monto'],
     'part_number': ['part_number', 'part number', 'numero de parte', 'item', 'item code']
@@ -258,6 +258,15 @@ def find_best_column(columns_list: list, keywords: list) -> Optional[str]:
                     continue
                 return col
 
+    # 3.5. MATCH NORMALIZADO SIN ESPACIOS/PUNTUACIÓN
+    for col in columns_list:
+        col_norm = normalize_col_name(col)
+        for kw_upper in keywords_upper:
+            if normalize_col_name(kw_upper) in col_norm:
+                if kw_upper == 'BU' and 'BULTO' in col_norm:
+                    continue
+                return col
+
     # 4. FUZZY MATCHING
     return fuzzy_match_column(columns_list, keywords)
 
@@ -274,6 +283,13 @@ def detect_fallback_column(df: pd.DataFrame, field_name: str) -> Optional[str]:
         return best if best_score >= 0.65 else None
 
     if field_name == 'bu':
+        # Buscamos primero columnas con tokens típicos de BU en el encabezado
+        bu_tokens = ['bu', 'businessunit', 'unidaddenegocio', 'unidad', 'area', 'division', 'empresa', 'departamento', 'depto', 'unit', 'ou']
+        for col in df.columns:
+            col_norm = normalize_col_name(col)
+            if any(token in col_norm for token in bu_tokens):
+                return col
+
         best = None
         best_score = 0.0
         for col in df.columns:
