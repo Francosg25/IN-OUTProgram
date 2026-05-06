@@ -7,21 +7,24 @@ from typing import Dict, Any
 
 logger = logging.getLogger(__name__)
 
+import yaml
+import logging
+
 class LogisticsPipelineOrchestrator:
-    def __init__(self, allocation_engine):
+    def __init__(self, allocation_engine, config_path: str = "pipeline_config.yaml"):
         self.allocation_engine = allocation_engine
-          
-        self.aliases = {
-            'reference': ['REFERENCE', 'CONTAINER NUMBER', 'WAYBILL NUMBER', 'REFERENCIA', 'CONTAINER'],
-            'bu': ['BU', 'OU', 'BUSINESS UNIT', 'UNIDAD DE NEGOCIO'],
-            'gross_weight': ['GROSS WEIGHT (KGS)', 'TOTAL GROSS WEIGHT', 'PESO BRUTO (KGS)', 'WEIGHT'],
-            'inbound': ['INBOUND'],
-            'outbound': ['OUTBOUND'],
-            'method': ['METHOD'],
-            'part_number': ['NO DE PARTE', 'PART NUMBER', 'ITEM CODE']
-        }
         
-        self.valid_bus = {'M01', 'M02', 'M19', 'M23', 'M45'} 
+        try:
+            with open(config_path, 'r') as file:
+                config = yaml.safe_load(file)
+                
+            self.aliases = config.get('aliases', {})
+            # Convertimos a set por performance
+            self.valid_bus = set(config.get('valid_bus', [])) 
+            
+        except FileNotFoundError:
+            logging.error(f"Archivo de configuración {config_path} no encontrado.")
+            raise
     
     def clean_bu_code(self, raw_bu: Any) -> str:
              if pd.isna(raw_bu):

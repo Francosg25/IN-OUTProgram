@@ -8,8 +8,12 @@ from io import BytesIO
 
 logger = logging.getLogger(__name__)
 
+import pandas as pd
+import re
+
 class BusinessRulesEngine:
-    """Clasificador Semántico de Números de Parte"""
+    """Clasificador Semántico de Números de Parte y Descripciones"""
+    
     @staticmethod
     def apply_classification_rules(df: pd.DataFrame) -> pd.DataFrame:
         if 'part_number' not in df.columns or 'bu' not in df.columns:
@@ -17,16 +21,37 @@ class BusinessRulesEngine:
             
         df_rules = df.copy()
         
+        # Diccionarios Extendidos
+        misc_keywords = [
+            'TAPA', 'CAJA', 'BASE', 'CHAROLA', 'PALLET', 'CARTON', 'PLASTICA', 'PLASTICO', 'WOOD', 
+            'CABLE', 'LENS', 'KIT', 'MODULE', 'ADAPTER', 'DISPLAY', 'MONITOR', 'SCREEN'
+        ]
+        
+        capex_keywords = [
+            'CAPEX', 'TOOLING', 'MACHINE', 'TESTER', 'POWER SUPPLY', 'ROBOT', 'STATION', 
+            'CONVEYOR', 'MOTOR', 'PUMP'
+        ]
+        
         def classify_part(row):
             part = str(row['part_number']).upper().strip()
             current_bu = str(row['bu']).strip()
             
-            if 'CAPEX' in part or (part.isalpha() and len(part) > 3 and 'TAPA' not in part and 'CAJA' not in part):
-                return 'Capex'
+            if part in ['NAN', 'NONE', '', 'NULL']:
+                return current_bu
+
+            if any(kw in part for kw in capex_keywords):
+                return 'CAPEX' # CORRECCIÓN: Todo mayúsculas
                 
-            misc_keywords = ['TAPA', 'CAJA', 'BASE', 'CHAROLA', 'PALLET', 'CARTON', 'PLASTICA', 'PLASTICO', 'WOOD']
-            if any(kw in part for kw in misc_keywords) or part.count(' ') >= 3:
-                return 'Miscelaneus'
+            part_only_letters = part.isalpha()
+            if part_only_letters and len(part) > 3 and not any(kw in part for kw in misc_keywords):
+                return 'CAPEX' # CORRECCIÓN: Todo mayúsculas
+
+            if any(kw in part for kw in misc_keywords):
+                return 'MISCELANEUS' # CORRECCIÓN: Todo mayúsculas
+                
+            num_spaces = part.count(' ')
+            if num_spaces >= 3 or len(part) > 30:
+                return 'MISCELANEUS' # CORRECCIÓN: Todo mayúsculas
                 
             return current_bu
             

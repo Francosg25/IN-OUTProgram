@@ -341,17 +341,15 @@ class LogisticsOrchestrator:
         # Limpiamos caracteres raros, dejando solo letras y números
         clean_val = re.sub(r'[^A-Z0-9]', '', val)
         
-        # CASO 1: El usuario escribió solo el número (Ej: "1", "19", "120")
+        #El usuario escribió solo el número (Ej: "1", "19", "120")
         if clean_val.isdigit():
             num = int(clean_val)
-            # Unidades de negocio en JE rara vez pasan del M1000. 
-            # Si es mayor (ej. 14000), es basura que se coló de otra columna.
             if 0 < num < 1000:
                 return f"M{num:02d}" if num < 100 else f"M{num}"
             else:
-                return "Miscelaneus" 
-                
-        # CASO 2: Tiene la 'M' pero le falta el cero (Ej: "M1", "M19")
+                return "MISCELANEUS"  
+            
+        #Tiene la 'M' pero le falta el cero (Ej: "M1", "M19")
         match = re.match(r'^M(\d+)$', clean_val)
         if match:
             num = int(match.group(1))
@@ -363,32 +361,58 @@ class LogisticsOrchestrator:
     def standardize_source_manual(self, df: pd.DataFrame, label: str, mapping: Dict[str, str]) -> pd.DataFrame:
         """Estandariza un DF usando un mapeo manual proporcionado por el usuario."""
         try:
+            # 1. Validación Estricta
             for canon, excel_col in mapping.items():
                 if excel_col and excel_col not in df.columns:
                     raise ValueError(f"Columna '{excel_col}' no encontrada en el archivo {label}. Columnas disponibles: {list(df.columns)}")
             
+            # 2. Extracción Robusta Anti-Duplicados
+            df_filtered = pd.DataFrame()
             rename_dict = {v: k for k, v in mapping.items() if v}
-            df_filtered = df[list(rename_dict.keys())].copy()
-            df_filtered.rename(columns=rename_dict, inplace=True)
+            
+            for excel_col, canon in rename_dict.items():
+                col_data = df[excel_col]
+                
+                # Si el Excel tiene encabezados duplicados, Pandas devuelve un DataFrame.
+                # Aislar la primera columna nos protege de crashes de dimensionalidad.
+                if isinstance(col_data, pd.DataFrame):
+                    col_data = col_data.iloc[:, 0]
+                    
+                df_filtered[canon] = col_data.copy()
             
             df_filtered['transport_type'] = label
+            
+            # Ahora es 100% seguro usar el accesor .str porque garantizamos que es una Series
             df_filtered['reference'] = df_filtered['reference'].astype(str).str.strip()
             
-            # --- AQUÍ APLICAMOS EL NUEVO SANITIZADOR ---
+            # --- LÓGICA DE RESCATE DE BU ---
+            if 'bu' not in df_filtered.columns:
+                def extract_bu_from_reference(ref_str):
+                    if pd.isna(ref_str) or str(ref_str).strip() == '':
+                        return 'DEFAULT_BU'
+                    match = re.search(r'M(\d{1,3})\b', str(ref_str).upper())
+                    if match:
+                        num = int(match.group(1))
+                        return f"M{num:02d}"
+                    return 'DEFAULT_BU'
+                
+                df_filtered['bu'] = df_filtered['reference'].apply(extract_bu_from_reference)
+                
+            # SANITIZADOR INTELIGENTE
             df_filtered['bu'] = df_filtered['bu'].apply(self._normalize_bu)
 
-            # Manejar gross_weight: imputar 1 si no está mapeada o si faltan valores.
+            # 3. Casteo de Pesos y Precios
             if 'gross_weight' not in df_filtered.columns:
                 df_filtered['gross_weight'] = 1.0
             else:
                 df_filtered['gross_weight'] = pd.to_numeric(df_filtered['gross_weight'], errors='coerce').fillna(1.0)
             
-            # Manejar price opcional
             if 'price' not in df_filtered.columns:
                 df_filtered['price'] = 0.0
             else:
                 df_filtered['price'] = pd.to_numeric(df_filtered['price'], errors='coerce').fillna(0.0)
 
+            # 4. Auditoría de Datos
             df_filtered['note'] = ''
             missing_weight = df_filtered['gross_weight'] <= 0
             if missing_weight.any():
@@ -399,16 +423,19 @@ class LogisticsOrchestrator:
             if missing_price.any():
                 df_filtered.loc[missing_price, 'note'] += 'Precio ausente; '
 
-            # Asegurar que reference y bu existen
             if 'reference' not in df_filtered.columns or 'bu' not in df_filtered.columns:
-                st.error(f"Faltan columnas obligatorias (reference o bu) en {label}.")
-                return pd.DataFrame()
+                raise ValueError(f"Faltan columnas obligatorias (reference o bu) en {label}.")
 
             return df_filtered
+            
+        except ValueError as ve:
+             raise ve
         except Exception as e:
-            st.error(f"Error al procesar {label}: {e}")
-            return pd.DataFrame()
-
+            logger.error(f"Error interno al procesar {label}: {str(e)}", exc_info=True)
+            import streamlit as st
+            st.error(f"**Error técnico procesando {label}:** `{str(e)}`")
+            raise RuntimeError(f"Fallo en {label}. Detalle técnico: {str(e)}") from e
+            
     def run_pipeline(self, processed_dfs: List[pd.DataFrame], df_costs: pd.DataFrame) -> pd.DataFrame:
         """Ejecuta la unificación de DFs y el cálculo de prorrateo."""
         if not processed_dfs:
@@ -416,6 +443,41 @@ class LogisticsOrchestrator:
         
         unified = pd.concat(processed_dfs, ignore_index=True)
         return self.allocation_engine.calculate_outbound(unified, df_costs)
+    
+    def standardize_outbound_robust(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Versión robusta para Outbound que resuelve la ambigüedad de 
+        columnas duplicadas en los reportes de JE.
+        """
+        try:
+            # 1. Identificar la columna de costo correcta (Fix Cost suele ser la maestra)
+            # Buscamos la columna que sume ~126k, no la que sume ~32k
+            potential_costs = [c for c in df.columns if 'FIX COST' in c.upper() or 'CALC_EXP' in c.upper()]
+            cost_col = potential_costs[0] if potential_costs else df.columns[detected_index_of_cost]
+
+            # 2. Identificar la BU correcta (Evitar las columnas con NaNs)
+            # En tu Excel, la columna 'BU.2' es la que parece tener el mapeo final
+            bu_candidates = [c for c in df.columns if 'BU' in c.upper()]
+            # Elegimos la que tenga menos nulos
+            bu_col = min(bu_candidates, key=lambda c: df[c].isnull().sum())
+
+            # 3. Creación del DataFrame Limpio
+            df_std = pd.DataFrame()
+            df_std['reference'] = df['Reference'].astype(str).str.strip()
+            df_std['bu'] = df[bu_col].astype(str).str.strip().str.upper()
+            df_std['price'] = pd.to_numeric(df[cost_col], errors='coerce').fillna(0)
+            df_std['transport_type'] = 'Outbound'
+
+            # 4. Filtro de Integridad: Eliminar filas donde el costo es 0 o la BU es 'TOTAL'
+            df_std = df_std[
+                (df_std['price'] > 0) & 
+                (~df_std['bu'].isin(['TOTAL', 'NAN', 'N/A']))
+            ]
+
+            return df_std
+
+        except Exception as e:
+            raise RuntimeError(f"Error en mapeo robusto Outbound: {str(e)}")
 
 
 def build_executive_tables(flat_summary: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -425,6 +487,11 @@ def build_executive_tables(flat_summary: pd.DataFrame) -> Tuple[pd.DataFrame, pd
 
     df_c = flat_summary.copy()
     df_c['Transport'] = df_c['Transport'].fillna('UNKNOWN').astype(str)
+    
+    # --- RED DE SEGURIDAD (SANITIZACIÓN FINAL) ---
+    # Forzamos mayúsculas y quitamos espacios residuales para evitar duplicados en el Pivot
+    if 'BU' in df_c.columns:
+        df_c['BU'] = df_c['BU'].astype(str).str.strip().str.upper()
 
     # Tabla de Porcentajes
     pct_pivot = df_c.pivot_table(
@@ -434,6 +501,7 @@ def build_executive_tables(flat_summary: pd.DataFrame) -> Tuple[pd.DataFrame, pd
         aggfunc='sum', 
         fill_value=0
     )
+    
     pct_pivot.index = pct_pivot.index + ' %PCT'
     pct_pivot.index.name = 'Type' # Coincide con la imagen
 
@@ -520,16 +588,17 @@ def main():
                 m_price = select_with_default(f"Precio / Valor ({label}) - Opcional", f"sel_price_{label}", default_price)
                 m_part = select_with_default(f"Número de Parte ({label}) - Opcional", f"sel_part_{label}", default_part)
 
-                if m_ref and m_bu:
-                    mapping = {"reference": m_ref, "bu": m_bu}
+                if m_ref: 
+                    mapping = {"reference": m_ref}
+                    if m_bu: mapping["bu"] = m_bu
                     if m_container: mapping["container_number"] = m_container
                     if m_w: mapping["gross_weight"] = m_w
                     if m_price: mapping["price"] = m_price
-                    if m_part: mapping["part_number"] = m_part # Guarda el mapeo del no. de parte
+                    if m_part: mapping["part_number"] = m_part 
                     st.session_state.mapping_cache[label] = mapping
                     return df, mapping
                 else:
-                    st.warning("Selecciona al menos Referencia y BU para habilitar esta fuente.")
+                    st.warning("Selecciona al menos Referencia para habilitar esta fuente.")
         return None, None
 
     sea_data, sea_map = create_mapping_ui(sea_file, "Sea")
