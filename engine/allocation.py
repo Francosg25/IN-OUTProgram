@@ -3,6 +3,8 @@ import numpy as np
 import logging
 import re
 from typing import Literal, Any
+from io import BytesIO
+
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,85 @@ class CostAllocationEngine:
         match = re.search(pattern, str(ref).upper())
         if match: return match.group(0)
         return re.sub(r'[^A-Z0-9]', '', str(ref).upper())
+
+    def generate_auditable_excel(self, df_transactions: pd.DataFrame, df_costs: pd.DataFrame, buffer: BytesIO):
+        """
+        Enrutador (Router) que divide el DataFrame unificado y delega la 
+        inyección de fórmulas según el tipo de transporte.
+        """
+        try:
+            writer = pd.ExcelWriter(buffer, engine='xlsxwriter')
+            
+            # Dividir los flujos
+            df_inbound = df_transactions[df_transactions['transport_type'].isin(['Land', 'Sea'])].copy()
+            df_outbound = df_transactions[df_transactions['transport_type'].str.upper() == 'OUTBOUND'].copy()
+            
+            # Ejecutar estrategias de inyección
+            if not df_inbound.empty:
+                self._inject_inbound_formulas(writer, df_inbound, df_costs)
+                
+            if not df_outbound.empty:
+                self._inject_outbound_formulas(writer, df_outbound, df_costs)
+                
+            writer.close()
+            return buffer
+        except Exception as e:
+            logger.error(f"Fallo crítico en el enrutador de auditoría: {e}")
+            raise
+
+    def _inject_inbound_formulas(self, writer: pd.ExcelWriter, df: pd.DataFrame, df_costs: pd.DataFrame):
+        """Estrategia para Land/Sea (Costo Global Fijo)."""
+        df = BusinessRulesEngine.apply_classification_rules(df)
+        df['group_key'] = df['reference'].apply(self._clean_ref).fillna(df['bu'])
+        
+        cols_to_export = ['reference', 'bu', 'gross_weight', 'transport_type', 'group_key']
+        df[cols_to_export].to_excel(writer, sheet_name='Inbound_Auditable', index=False)
+        
+        workbook, worksheet = writer.book, writer.sheets['Inbound_Auditable']
+        money_fmt = workbook.add_format({'num_format': '$#,##0.00'})
+        pct_fmt = workbook.add_format({'num_format': '0.000%'})
+        
+        # Inyección de costo base (Fallback temporal, asumiendo primer costo)
+        cost_col = [c for c in df_costs.columns if 'cost' in c.lower() or 'usd' in c.lower()][0]
+        costo_total = pd.to_numeric(df_costs[cost_col].iloc[0], errors='coerce') if not df_costs.empty else 0.0
+        
+        worksheet.write('Z1', costo_total, money_fmt)
+        worksheet.write('Y1', 'Total Cost:')
+        
+        for i in range(2, len(df) + 2):
+            worksheet.write_formula(f'F{i}', f'=IFERROR(C{i}*1/SUMIFS(C:C, E:E, E{i}), 0)', pct_fmt)
+            worksheet.write_formula(f'G{i}', f'=F{i}*$Z$1', money_fmt)
+            
+        worksheet.write(0, 5, '% Propot'); worksheet.write(0, 6, 'Amount')
+        worksheet.set_column('A:G', 15)
+
+    def _inject_outbound_formulas(self, writer: pd.ExcelWriter, df: pd.DataFrame, df_costs: pd.DataFrame):
+        """Estrategia para Outbound (Matriz de Costos por Referencia - XLOOKUP)."""
+        df = BusinessRulesEngine.apply_classification_rules(df)
+        df['group_key'] = df['reference'].apply(self._clean_ref).fillna('UNKNOWN')
+        
+        ref_col = [c for c in df_costs.columns if 'ref' in c.lower() or 'bu' in c.lower()][0]
+        cost_col = [c for c in df_costs.columns if 'cost' in c.lower() or 'usd' in c.lower()][0]
+        
+        costs_subset = df_costs[[ref_col, cost_col]].rename(columns={ref_col: 'Cost_Ref', cost_col: 'Fix_Cost'})
+        costs_subset['Cost_Ref'] = costs_subset['Cost_Ref'].apply(self._clean_ref)
+        costs_subset = costs_subset.groupby('Cost_Ref', as_index=False)['Fix_Cost'].sum()
+
+        costs_subset.to_excel(writer, sheet_name='Outbound_Auditable', index=False, startcol=0)
+        
+        cols_to_export = ['reference', 'bu', 'gross_weight', 'transport_type', 'group_key']
+        df[cols_to_export].to_excel(writer, sheet_name='Outbound_Auditable', index=False, startcol=3)
+        
+        workbook, worksheet = writer.book, writer.sheets['Outbound_Auditable']
+        money_fmt = workbook.add_format({'num_format': '$#,##0.00'})
+        pct_fmt = workbook.add_format({'num_format': '0.000%'})
+        
+        for i in range(2, len(df) + 2):
+            worksheet.write_formula(f'I{i}', f'=IFERROR(F{i}/SUMIFS(F:F, H:H, H{i}), 0)', pct_fmt)
+            worksheet.write_formula(f'J{i}', f'=XLOOKUP(H{i}, A:A, B:B, 0) * I{i}', money_fmt)
+            
+        worksheet.write(0, 8, '% Propot'); worksheet.write(0, 9, 'Calc_Exp')
+        worksheet.set_column('A:J', 16)
 
     def calculate_outbound(self, df_transactions: pd.DataFrame, df_costs: pd.DataFrame) -> pd.DataFrame:
         df = df_transactions.copy()
@@ -175,6 +256,86 @@ class CostAllocationEngine:
 
         except Exception as e:
             logger.error(f"Fallo en motor de prorrateo: {str(e)}")
+            raise
+
+    def generate_outbound_auditable_excel(self, df_transactions: pd.DataFrame, df_costs: pd.DataFrame, output_path_or_buffer):
+     
+        try:
+            # 1. Limpieza y preparación de datos base
+            df = df_transactions.copy()
+            df['gross_weight'] = pd.to_numeric(df.get('gross_weight', 0), errors='coerce').fillna(0.0)
+            df = BusinessRulesEngine.apply_classification_rules(df)
+            
+            # Limpieza de Llave Primaria (Reference)
+            df['group_key'] = df['reference'].apply(self._clean_ref).fillna('UNKNOWN')
+            
+            # Preparar tabla de costos para el XLOOKUP
+            ref_col_costs = [c for c in df_costs.columns if 'ref' in c.lower() or 'bu' in c.lower()][0]
+            cost_col = [c for c in df_costs.columns if 'cost' in c.lower() or 'amount' in c.lower() or 'usd' in c.lower()][0]
+            
+            costs_subset = df_costs[[ref_col_costs, cost_col]].copy()
+            costs_subset.columns = ['Cost_Reference', 'Fix_Cost']
+            costs_subset['Cost_Reference'] = costs_subset['Cost_Reference'].apply(self._clean_ref)
+            costs_subset = costs_subset.groupby('Cost_Reference', as_index=False)['Fix_Cost'].sum()
+
+            # 2. Inicializar XlsxWriter
+            writer = pd.ExcelWriter(output_path_or_buffer, engine='xlsxwriter')
+            
+            # Escribir primero la tabla de Costos (Serán nuestras columnas A y B)
+            costs_subset.to_excel(writer, sheet_name='Outbound_Auditable', index=False, startcol=0, startrow=0)
+            
+            # Escribir las transacciones al lado (Empezando en la columna D, que es índice 3)
+            cols_to_export = ['reference', 'bu', 'gross_weight', 'transport_type', 'group_key']
+            df_export = df[cols_to_export]
+            df_export.to_excel(writer, sheet_name='Outbound_Auditable', index=False, startcol=3, startrow=0)
+            
+            workbook = writer.book
+            worksheet = writer.sheets['Outbound_Auditable']
+            
+            # Formatos de Alta Fidelidad
+            money_fmt = workbook.add_format({'num_format': '$#,##0.00'})
+            pct_fmt = workbook.add_format({'num_format': '0.00000%'})
+            header_fmt = workbook.add_format({'bold': True, 'bg_color': '#D3D3D3', 'border': 1})
+            
+            # 3. Mapeo de Columnas para Inyección
+            # Tabla de Costos: A = Cost_Reference, B = Fix_Cost
+            # Tabla Transaccional: D=Ref, E=BU, F=Weight, G=Type, H=Group_Key (Referencia Limpia)
+            col_cost_ref = 'A'
+            col_cost_val = 'B'
+            
+            col_trans_weight = 'F'
+            col_trans_key = 'H'
+            
+            col_idx_propot = 3 + len(cols_to_export) # Índice 8 -> Columna I
+            col_idx_amount = col_idx_propot + 1      # Índice 9 -> Columna J
+            
+            col_propot_letter = 'I'
+            col_amount_letter = 'J'
+            
+            worksheet.write(0, col_idx_propot, '% Proportion', header_fmt)
+            worksheet.write(0, col_idx_amount, 'Calc_Exp', header_fmt)
+            
+            total_rows = len(df_export)
+            
+            # 4. Inyección del Motor (XLOOKUP + SUMIFS)
+            for i in range(2, total_rows + 2):
+                # =F2 / SUMIFS(F:F, H:H, H2)
+                f_propot = f'=IFERROR({col_trans_weight}{i}/SUMIFS({col_trans_weight}:{col_trans_weight}, {col_trans_key}:{col_trans_key}, {col_trans_key}{i}), 0)'
+                worksheet.write_formula(f'{col_propot_letter}{i}', f_propot, pct_fmt)
+                
+                # =XLOOKUP(H2, A:A, B:B, 0) * I2
+                # Nota: Si el XLOOKUP no encuentra la ref, devuelve 0 para no romper el Excel
+                f_amount = f'=XLOOKUP({col_trans_key}{i}, {col_cost_ref}:{col_cost_ref}, {col_cost_val}:{col_cost_val}, 0) * {col_propot_letter}{i}'
+                worksheet.write_formula(f'{col_amount_letter}{i}', f_amount, money_fmt)
+            
+            worksheet.set_column('A:J', 16)
+            writer.close()
+            
+            logger.info("Excel Outbound Auditable con XLOOKUP inyectado correctamente.")
+            return output_path_or_buffer
+            
+        except Exception as e:
+            logger.error(f"Fallo crítico en motor Outbound: {e}")
             raise
         
     

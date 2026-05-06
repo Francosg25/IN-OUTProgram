@@ -9,6 +9,21 @@ from pathlib import Path
 from typing import Dict, Any, Literal, List, Optional, Tuple
 from io import BytesIO
 
+def render_safe_table(df_obj):
+    """
+    Bypass de seguridad: Convierte DataFrames/Stylers a HTML puro para 
+    evadir la carga de PyArrow en entornos con políticas de Application Control.
+    """
+    if df_obj is None or (hasattr(df_obj, 'empty') and df_obj.empty):
+        return
+    
+    html_str = df_obj.to_html()
+    
+    st.markdown(
+        f'<div style="overflow-x: auto; max-height: 400px; margin-bottom: 20px; border: 1px solid #e6e6e6; border-radius: 5px;">{html_str}</div>', 
+        unsafe_allow_html=True
+    )
+
 try:
     from engine.allocation import CostAllocationEngine
 except ImportError:
@@ -43,7 +58,7 @@ def smart_read_excel(file_obj) -> pd.DataFrame:
         
         # Diccionario expandido
         keywords = ['REF', 'REFERENCE', 'GUIA', 'WAYBILL', 'AWB', 'TRACKING', 
-                    'BU', 'BUSINESS UNIT', 'UNIDAD', 
+                    'BU', 'OU', 'BUSINESS UNIT', 'UNIDAD', 
                     'PESO', 'WEIGHT', 'KGS', 'LBS', 'GROSS', 
                     'PART', 'ITEM', 'QTY', 'PIECES', 'BULTOS', 
                     'CONTAINER', 'CONTENEDOR', 'CNTR', 'EQUIPO', 
@@ -125,7 +140,7 @@ TRAVEL_COLUMN_ALIASES = {
     'Sea': {
         'reference': ['reference', 'ref', 'guia', 'guía', 'awb', 'booking', 'shipment', 'documento'],
         'container_number': ['container', 'contenedor', 'cntr', 'box', 'equipo'],
-        'bu': ['bu', 'business unit', 'unidad de negocio', 'unidad', 'area', 'division'],
+        'bu': ['bu', 'ou', 'business unit', 'unidad de negocio', 'unidad', 'area', 'division'],
         'gross_weight': ['gross_weight', 'peso', 'weight', 'kg', 'kgs', 'peso bruto'],
         'price': ['price', 'precio', 'cost', 'valor', 'amount', 'monto'],
         'part_number': ['part_number', 'part number', 'numero de parte', 'item', 'item code']
@@ -133,7 +148,7 @@ TRAVEL_COLUMN_ALIASES = {
     'Land': {
         'reference': ['reference', 'ref', 'doc', 'documento', 'orden', 'guia', 'guía'],
         'container_number': ['container', 'contenedor', 'truck', 'camion', 'vehiculo'],
-        'bu': ['bu', 'business unit', 'unidad de negocio', 'unidad', 'area', 'division'],
+        'bu': ['bu', 'ou', 'business unit', 'unidad de negocio'],
         'gross_weight': ['gross_weight', 'peso', 'weight', 'kg', 'kgs', 'peso bruto'],
         'price': ['price', 'precio', 'cost', 'valor', 'amount', 'monto'],
         'part_number': ['part_number', 'part number', 'numero de parte', 'item', 'item code']
@@ -141,7 +156,7 @@ TRAVEL_COLUMN_ALIASES = {
     'Outbound': {
         'reference': ['reference', 'ref', 'shipment', 'export', 'tracking', 'documento', 'awb'],
         'container_number': ['container', 'contenedor', 'cntr', 'box', 'equipo'],
-        'bu': ['bu', 'business unit', 'unidad de negocio', 'unidad', 'empresa', 'division'],
+        'bu': ['bu', 'ou', 'business unit', 'unidad de negocio', 'unidad', 'empresa', 'division'],
         'gross_weight': ['gross_weight', 'peso', 'weight', 'kg', 'kgs', 'peso bruto'],
         'price': ['price', 'precio', 'cost', 'valor', 'amount', 'monto'],
         'part_number': ['part_number', 'part number', 'numero de parte', 'item', 'item code']
@@ -151,7 +166,7 @@ TRAVEL_COLUMN_ALIASES = {
 GENERIC_COLUMN_ALIASES = {
     'reference': ['reference', 'ref', 'guia', 'guía', 'documento', 'doc', 'tracking', 'awb', 'waybill'],
     'container_number': ['container', 'contenedor', 'cntr', 'box', 'equipo'],
-    'bu': ['bu', 'business unit', 'unidad de negocio', 'unidad', 'area', 'division'],
+    'bu': ['bu', 'ou', 'business unit', 'unidad de negocio'],
     'gross_weight': ['gross_weight', 'peso', 'weight', 'kg', 'kgs', 'peso bruto'],
     'price': ['price', 'precio', 'cost', 'valor', 'amount', 'monto'],
     'part_number': ['part_number', 'part number', 'numero de parte', 'item', 'item code']
@@ -292,33 +307,59 @@ def suggest_mapping(df: pd.DataFrame, label: str) -> dict:
         mapping[field] = candidate
     return mapping
 
+
 class LogisticsOrchestrator:
-    """
-    Orquestador de Datos: Soporta mapeo manual dinámico por archivo.
-    """
+    """Orquestador de Datos: Soporta mapeo manual dinámico por archivo."""
     def __init__(self, allocation_engine):
         self.allocation_engine = allocation_engine
         self.canon_map = ['reference', 'bu', 'gross_weight']
 
+    def _normalize_bu(self, raw_val: Any) -> str:
+        """
+        Sanitizador Estricto para Business Units (Ej: 1 -> M01, M-19 -> M19).
+        """
+        val = str(raw_val).strip().upper()
+        if val in ['NAN', 'NONE', '', 'NULL']:
+            return 'N/A'
+            
+        # Limpiamos caracteres raros, dejando solo letras y números
+        clean_val = re.sub(r'[^A-Z0-9]', '', val)
+        
+        # CASO 1: El usuario escribió solo el número (Ej: "1", "19", "120")
+        if clean_val.isdigit():
+            num = int(clean_val)
+            # Unidades de negocio en JE rara vez pasan del M1000. 
+            # Si es mayor (ej. 14000), es basura que se coló de otra columna.
+            if 0 < num < 1000:
+                return f"M{num:02d}" if num < 100 else f"M{num}"
+            else:
+                return "Miscelaneus" 
+                
+        # CASO 2: Tiene la 'M' pero le falta el cero (Ej: "M1", "M19")
+        match = re.match(r'^M(\d+)$', clean_val)
+        if match:
+            num = int(match.group(1))
+            return f"M{num:02d}" if num < 100 else f"M{num}"
+            
+        # CASO 3: Es una cadena de texto (Ej: "CAPEX", "MISCELANEUS", o texto no mapeado)
+        return clean_val
+
     def standardize_source_manual(self, df: pd.DataFrame, label: str, mapping: Dict[str, str]) -> pd.DataFrame:
         """Estandariza un DF usando un mapeo manual proporcionado por el usuario."""
         try:
-            # Verificar que las columnas mapeadas existen en el DataFrame
             for canon, excel_col in mapping.items():
                 if excel_col and excel_col not in df.columns:
-                    st.error(f"Columna '{excel_col}' no encontrada en el archivo {label}. Columnas disponibles: {list(df.columns)}")
-                    return pd.DataFrame()
+                    raise ValueError(f"Columna '{excel_col}' no encontrada en el archivo {label}. Columnas disponibles: {list(df.columns)}")
             
-            # Invertimos el mapeo para renombrar: {col_del_excel: nombre_canonico}
             rename_dict = {v: k for k, v in mapping.items() if v}
-            
-            # Solo tomamos las columnas mapeadas
             df_filtered = df[list(rename_dict.keys())].copy()
             df_filtered.rename(columns=rename_dict, inplace=True)
             
             df_filtered['transport_type'] = label
             df_filtered['reference'] = df_filtered['reference'].astype(str).str.strip()
-            df_filtered['bu'] = df_filtered['bu'].astype(str).str.strip().str.upper()
+            
+            # --- AQUÍ APLICAMOS EL NUEVO SANITIZADOR ---
+            df_filtered['bu'] = df_filtered['bu'].apply(self._normalize_bu)
 
             # Manejar gross_weight: imputar 1 si no está mapeada o si faltan valores.
             if 'gross_weight' not in df_filtered.columns:
@@ -359,6 +400,7 @@ class LogisticsOrchestrator:
         
         unified = pd.concat(processed_dfs, ignore_index=True)
         return self.allocation_engine.calculate_outbound(unified, df_costs)
+
 
 def build_executive_tables(flat_summary: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Transforma el resumen plano en vistas ejecutivas pivotadas (Formato Johnson Electric)."""
@@ -421,8 +463,6 @@ def main():
 
     st.markdown("Mapeo de Columnas")
     st.caption("El sistema detecta automáticamente las columnas más probables según el tipo de viaje. Corrige sólo aquellas que no se identifiquen con precisión.")
-    if "mapping_cache" not in st.session_state:
-        st.session_state.mapping_cache = mapping_cache
 
    
     def create_mapping_ui(file, label):
@@ -503,7 +543,6 @@ def main():
                 return
 
             if hasattr(cost_file, 'name') and cost_file.name.lower().endswith('.csv'):
-                # Si el archivo se llama explícitamente .csv
                 df_costs = pd.read_csv(cost_file, encoding='latin1')
             else:
                 df_costs = smart_read_excel(cost_file)
@@ -518,7 +557,7 @@ def main():
                 
                 # --- DASHBOARD DE RESULTADOS ---
                 if recon:
-                    st.markdown("####Estado de Conciliación")
+                    st.markdown("#### Estado de Conciliación")
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("Total Facturado", f"${recon.get('total_facturado', 0):,.2f}")
                     m2.metric("Total Asignado", f"${recon.get('total_asignado', 0):,.2f}")
@@ -534,51 +573,63 @@ def main():
                 t1, t2 = st.tabs(["Reporte Ejecutivo", "Auditoría Detallada"])
                 with t1:
                     st.write("### Summary final por BU y Tipo de Viaje")
-                    st.dataframe(summary_report.style.format({"%PCT": "{:.1%}", "Arg. Var $": "${:,.0f}"}), use_container_width=True)
+                    # Usamos el Styler de Pandas y lo pasamos al bypass
+                    styled_summary = summary_report.style.format({"%PCT": "{:.1%}", "Arg. Var $": "${:,.0f}"})
+                    render_safe_table(styled_summary)
+                    
                     st.write("**Asignación Porcentual (%PCT)**")
-                    st.dataframe(pct_tab.style.format("{:.1%}"), use_container_width=True)
+                    render_safe_table(pct_tab.style.format("{:.1%}"))
+                    
                     st.write("**Distribución Monetaria ($)**")
-                    st.dataframe(mon_tab.style.format("${:,.0f}"), use_container_width=True)
-                    
-                    buffer = BytesIO()
-                    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                        # Escribir tabla de porcentajes arriba
-                        pct_tab.to_excel(writer, sheet_name='Reporte', startrow=0)
-                        # Escribir tabla de dinero abajo (dejando un espacio de 2 filas)
-                        mon_tab.to_excel(writer, sheet_name='Reporte', startrow=len(pct_tab) + 2)
-                        # Pestaña de respaldo
-                        final_summary.to_excel(writer, sheet_name='Base de Datos (Auditoría)', index=False)
-                    
-                    st.download_button(
-                        label="📥 Descargar Reporte en Excel",
-                        data=buffer.getvalue(),
-                        file_name="Consolidado_Logistico_IN_OUT.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        type="primary"
-                    )
+                    render_safe_table(mon_tab.style.format("${:,.0f}"))
+
                 
+                    
+                    try:
+                        buffer = BytesIO()
+                        # Si implementaste el generate_auditable_excel que definimos antes
+                        if hasattr(engine, 'generate_auditable_excel'):
+                            # El engine se encarga de crear el Excel con fórmulas y guardarlo en el buffer
+                            engine.generate_auditable_excel(unified, df_costs, buffer)
+                        else:
+                            # Fallback de seguridad si aún no lo implementas
+                            st.warning("Modo Auditable no encontrado en el Engine. Descargando datos planos.")
+                            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                                pct_tab.to_excel(writer, sheet_name='Reporte', startrow=0)
+                                mon_tab.to_excel(writer, sheet_name='Reporte', startrow=len(pct_tab) + 2)
+                                final_summary.to_excel(writer, sheet_name='Base_Datos', index=False)
+                        
+                        st.download_button(
+                            label="Descargar Excel Auditable (Con Fórmulas)",
+                            data=buffer.getvalue(),
+                            file_name="Consolidado_Logistico_IN_OUT_Auditoria.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            type="primary"
+                        )
+                    except Exception as excel_err:
+                        st.error(f"Fallo en la generación del Excel Auditable: {str(excel_err)}")
+
                 with t2:
                     st.write("Datos procesados y cruzados:")
-                    st.dataframe(final_summary, use_container_width=True)
+                    render_safe_table(final_summary)
+                    
                     st.markdown("---")
                     notes = final_summary[final_summary['Note'].notna()] if 'Note' in final_summary.columns else pd.DataFrame()
                     if not notes.empty:
                         st.write("### Filas con imputaciones o reglas aplicadas")
-                        st.dataframe(notes, use_container_width=True)
+                        render_safe_table(notes)
                     else:
                         st.info("No se detectaron imputaciones automáticas en el reporte final.")
-                    st.markdown("### Datos originales cargados con notas de auditoría")
-                    audit_data = unified.copy()
-                    if 'note' in audit_data.columns:
-                        audit_data = audit_data[audit_data['note'].astype(bool)]
-                    if not audit_data.empty:
-                        st.dataframe(audit_data, use_container_width=True)
-                    else:
-                        st.info("No hay registros con notas de auditoría en las cargas originales.")
 
+        # --- CAPTURA DE ERRORES FAIL FAST ---
+        except ValueError as ve:
+            st.error("###Validación de Datos Fallida")
+            st.warning(str(ve))
+            st.info("Por favor, verifica el mapeo de columnas y los archivos subidos.")
         except Exception as e:
-            st.error(f"Fallo en el pipeline: {e}")
-            logger.exception(e)
+            st.error("###Error crítico en el sistema")
+            st.exception(e)
+            logger.exception("Traceback completo:")
 
 if __name__ == "__main__":
     main()

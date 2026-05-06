@@ -1,3 +1,5 @@
+from io import BytesIO
+
 import pandas as pd
 import logging
 import re
@@ -7,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 class LogisticsPipelineOrchestrator:
     def __init__(self, allocation_engine):
-        self.allocation_engine = allocation_engin
+        self.allocation_engine = allocation_engine
           
         self.aliases = {
             'reference': ['REFERENCE', 'CONTAINER NUMBER', 'WAYBILL NUMBER', 'REFERENCIA', 'CONTAINER'],
@@ -37,12 +39,6 @@ class LogisticsPipelineOrchestrator:
                     return clean_str # Es una BU válida en el rango
 
              return clean_str if clean_str else 'DEFAULT_BU'
-            
-             clean_str = str(raw_bu).strip().upper()
-        
-             clean_str = re.sub(r'[^A-Z0-9]', '', clean_str)
-        
-             return clean_str if clean_str else 'DEFAULT_BU'
     
 
     def _extract_and_standardize(self, file_path: Any, source_type: str, transport_label: str) -> pd.DataFrame:
@@ -56,7 +52,8 @@ class LogisticsPipelineOrchestrator:
             for canon_col, possible_names in self.aliases.items():
                 found = False
                 for name in possible_names:
-                    matched_cols = [c for c in df_raw.columns if name in c]
+                    # Búsqueda de columnas ignorando espacios extra
+                    matched_cols = [c for c in df_raw.columns if name in c.replace(" ", "")]
                     if matched_cols:
                         df_std[canon_col] = df_raw[matched_cols[0]]
                         found = True
@@ -67,16 +64,34 @@ class LogisticsPipelineOrchestrator:
                         if canon_col == 'bu':
                             df_std['bu'] = 'DEFAULT_BU'
                         else:
-                            logger.error(f"Falta columna crítica '{canon_col}' en {transport_label}")
-                            return pd.DataFrame()
+                            # FAIL FAST: Lanzamos un error explícito para capturarlo en la UI
+                            columnas_presentes = ", ".join(df_raw.columns.tolist())
+                            raise ValueError(
+                                f"❌ Error en el archivo '{transport_label}': No se encontró la columna requerida para '{canon_col}'.\n"
+                                f"El sistema buscó los nombres: {possible_names}.\n"
+                                f"Columnas que tiene tu Excel: [{columnas_presentes}]"
+                            )
                     else:
-                        # Columnas opcionales (como inbound, method, part_number)
                         df_std[canon_col] = None
 
-            if 'bu' in df_std.columns:
-                df_std['bu'] = df_std['bu'].apply(self.clean_bu_code)
+            if 'part_number' in df_std.columns and 'bu' in df_std.columns:
+                df_std['bu'] = df_std.apply(self.apply_business_rules, axis=1)
 
-            def apply_business_rules(row):
+            df_std['transport_type'] = transport_label
+            df_std['gross_weight'] = pd.to_numeric(df_std['gross_weight'], errors='coerce').fillna(0)
+
+            return df_std
+
+        except Exception as e:
+            # Propagamos el ValueError para que llegue a Streamlit
+            if isinstance(e, ValueError):
+                raise e
+            logger.error(f"Error inesperado procesando {transport_label}: {e}")
+            raise RuntimeError(f"El archivo {transport_label} está corrupto o no se puede leer.")
+    
+
+    @staticmethod
+    def apply_business_rules(row):
                 part_val = str(row['part_number']).upper() if row['part_number'] else ""
                 
                 # 1. REGLA CAPEX: Si contiene "CAPEX" o NO tiene números (solo letras/guiones)
@@ -98,17 +113,7 @@ class LogisticsPipelineOrchestrator:
                 
                 return row['bu']
             
-            if 'part_number' in df_std.columns and 'bu' in df_std.columns:
-                df_std['bu'] = df_std.apply(apply_business_rules, axis=1)
 
-            df_std['transport_type'] = transport_label
-            df_std['gross_weight'] = pd.to_numeric(df_std['gross_weight'], errors='coerce').fillna(0)
-
-            return df_std
-
-        except Exception as e:
-            logger.error(f"Error estandarizando fuente {transport_label}: {e}")
-            return pd.DataFrame()
 
     def run_pipeline(self, files: Dict[str, Dict[str, str]], df_costs: pd.DataFrame) -> pd.DataFrame:
         standardized_dfs = []
@@ -128,7 +133,25 @@ class LogisticsPipelineOrchestrator:
         # Unificación
         df_unified = pd.concat(standardized_dfs, ignore_index=True)
         
-        # Procesamiento final (Prorrateo)
+        # Procesamiento estático (Para mostrar en la UI de Streamlit)
         summary_df = self.allocation_engine.calculate_outbound(df_unified, df_costs)
         
+        # Generación del reporte FÍSICO con fórmulas inyectadas 
+        try:
+            output_file = "Reporte_Auditable_Generado.xlsx"
+            self.allocation_engine.generate_auditable_excel(df_unified, df_costs, output_file)
+            logger.info("Reporte físico con fórmulas generado con éxito.")
+        except Exception as e:
+            logger.error(f"Error generando reporte auditable: {e}")
+            
         return summary_df
+    
+    def export_audit_report(self, df_unified: pd.DataFrame, df_costs: pd.DataFrame, buffer: BytesIO) -> BytesIO:
+        """
+        Facade para solicitar la generación del Excel auditable.
+        Abstrae a la UI de la complejidad del motor de Excel.
+        """
+        if df_unified.empty:
+            raise ValueError("No hay transacciones para auditar.")
+            
+        return self.allocation_engine.generate_auditable_excel(df_unified, df_costs, buffer)
