@@ -1,7 +1,6 @@
 {
   "Sea": {
     "reference": "SHIPMENT PRIORITY CODE",
-    "bu": "BU",
     "container_number": "CONTAINER NUMBER",
     "gross_weight": "GROSS_WEIGHT",
     "price": "INVOICE UNIT SELLING PRICE",
@@ -9,17 +8,15 @@
   },
   "Land": {
     "reference": "REFERENCIA",
-    "bu": "BU",
     "gross_weight": "GROSS_WEIGHT",
     "price": "MONTO PARTIDA",
     "part_number": "NO. PARTE PROV."
   },
   "Outbound": {
-    "reference": "PIECES",
-    "bu": "BU",
+    "reference": "REFERENCE",
     "container_number": "CONTAINER NUMBER",
     "gross_weight": "GROSS_WEIGHT",
-    "price": "LOG. EXP",
+    "price": "AMOUNT",
     "part_number": "ITEM"
   }
 }

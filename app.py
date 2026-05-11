@@ -341,7 +341,6 @@ class LogisticsOrchestrator:
         # Limpiamos caracteres raros, dejando solo letras y números
         clean_val = re.sub(r'[^A-Z0-9]', '', val)
         
-        #El usuario escribió solo el número (Ej: "1", "19", "120")
         if clean_val.isdigit():
             num = int(clean_val)
             if 0 < num < 1000:
@@ -349,7 +348,7 @@ class LogisticsOrchestrator:
             else:
                 return "MISCELANEUS"  
             
-        #Tiene la 'M' pero le falta el cero (Ej: "M1", "M19")
+        # CASO 2: Tiene la 'M' pero le falta el cero (Ej: "M1", "M19")
         match = re.match(r'^M(\d+)$', clean_val)
         if match:
             num = int(match.group(1))
@@ -357,6 +356,28 @@ class LogisticsOrchestrator:
             
         # CASO 3: Es una cadena de texto (Ej: "CAPEX", "MISCELANEUS", o texto no mapeado)
         return clean_val
+    
+    def _clean_reference_key(self, raw_ref: str) -> str:
+        """
+        Limpia la llave primaria (Waybill) para asegurar un Match perfecto al 100%.
+        Remueve sufijos como .M46, -2, etc.
+        Ej: 'FG-R-2180LE25.M46-M45-2' -> 'FG-R-2180LE25'
+        """
+        val = str(raw_ref).strip().upper()
+        if val in ['NAN', 'NONE', '']:
+            return 'UNKNOWN'
+        
+        # 1. Cortar en el primer punto (Ej. quita .M46)
+        if '.' in val:
+            val = val.split('.')[0]
+            
+        # 2. Si la guía tiene el formato estándar de JE (ej. FG-R-XXXX), aseguramos mantener solo esa parte
+        # Si tiene guiones extra al final que no son parte del prefijo, los cortamos.
+        match = re.search(r'^(FG-R-\w+)', val)
+        if match:
+            return match.group(1)
+            
+        return val
 
     def standardize_source_manual(self, df: pd.DataFrame, label: str, mapping: Dict[str, str]) -> pd.DataFrame:
         """Estandariza un DF usando un mapeo manual proporcionado por el usuario."""
@@ -435,7 +456,7 @@ class LogisticsOrchestrator:
             import streamlit as st
             st.error(f"**Error técnico procesando {label}:** `{str(e)}`")
             raise RuntimeError(f"Fallo en {label}. Detalle técnico: {str(e)}") from e
-            
+        
     def run_pipeline(self, processed_dfs: List[pd.DataFrame], df_costs: pd.DataFrame) -> pd.DataFrame:
         """Ejecuta la unificación de DFs y el cálculo de prorrateo."""
         if not processed_dfs:
@@ -453,9 +474,9 @@ class LogisticsOrchestrator:
             # 1. Identificar la columna de costo correcta (Fix Cost suele ser la maestra)
             # Buscamos la columna que sume ~126k, no la que sume ~32k
             potential_costs = [c for c in df.columns if 'FIX COST' in c.upper() or 'CALC_EXP' in c.upper()]
-            cost_col = potential_costs[0] if potential_costs else df.columns[detected_index_of_cost]
+            cost_col = potential_costs[0] if potential_costs else df.columns[0]
 
-            # 2. Identificar la BU correcta (Evitar las columnas con NaNs)
+            #  Identificar la BU correcta (Evitar las columnas con NaNs)
             # En tu Excel, la columna 'BU.2' es la que parece tener el mapeo final
             bu_candidates = [c for c in df.columns if 'BU' in c.upper()]
             # Elegimos la que tenga menos nulos
@@ -533,7 +554,7 @@ def main():
     cost_file = st.sidebar.file_uploader("Consolidado Facturación ($)", type=["xlsx", "csv"])
     st.sidebar.info("Este archivo debe contener las Referencias y los montos a prorratear.")
     
-    # 2. CARGA DE BASES OPERATIVAS
+
     st.subheader("Carga de Bases Operativas")
     c_sea, c_land, c_out = st.columns(3)
     
@@ -613,7 +634,7 @@ def main():
             return
 
         try:
-            engine = CostAllocationEngine()
+            engine = CostAllocationEngine(allocation_type='weight')
             orchestrator = LogisticsOrchestrator(engine)
             
             to_process = []
@@ -631,6 +652,11 @@ def main():
                 df_costs = pd.read_csv(cost_file, encoding='latin1')
             else:
                 df_costs = smart_read_excel(cost_file)
+            
+            logger.info(f"Cost file loaded: {len(df_costs)} rows, columns: {df_costs.columns.tolist()}")
+            if df_costs.empty:
+                st.error("El archivo de costos está vacío o no se pudo leer correctamente.")
+                return
             
             with st.spinner("Procesando datos y aplicando reglas de negocio..."):
                 unified = pd.concat(to_process, ignore_index=True)

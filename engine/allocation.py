@@ -5,11 +5,7 @@ import re
 from typing import Literal, Any
 from io import BytesIO
 
-
 logger = logging.getLogger(__name__)
-
-import pandas as pd
-import re
 
 class BusinessRulesEngine:
     """Clasificador Semántico de Números de Parte y Descripciones"""
@@ -21,7 +17,7 @@ class BusinessRulesEngine:
             
         df_rules = df.copy()
         
-        # Diccionarios Extendidos
+        # Diccionarios de detección (Johnson Electric Standards)
         misc_keywords = [
             'TAPA', 'CAJA', 'BASE', 'CHAROLA', 'PALLET', 'CARTON', 'PLASTICA', 'PLASTICO', 'WOOD', 
             'CABLE', 'LENS', 'KIT', 'MODULE', 'ADAPTER', 'DISPLAY', 'MONITOR', 'SCREEN'
@@ -34,24 +30,24 @@ class BusinessRulesEngine:
         
         def classify_part(row):
             part = str(row['part_number']).upper().strip()
-            current_bu = str(row['bu']).strip()
+            current_bu = str(row['bu']).strip().upper()
             
             if part in ['NAN', 'NONE', '', 'NULL']:
                 return current_bu
 
             if any(kw in part for kw in capex_keywords):
-                return 'CAPEX' # CORRECCIÓN: Todo mayúsculas
+                return 'CAPEX' 
                 
             part_only_letters = part.isalpha()
             if part_only_letters and len(part) > 3 and not any(kw in part for kw in misc_keywords):
-                return 'CAPEX' # CORRECCIÓN: Todo mayúsculas
+                return 'CAPEX' 
 
             if any(kw in part for kw in misc_keywords):
-                return 'MISCELANEUS' # CORRECCIÓN: Todo mayúsculas
+                return 'MISCELANEUS' 
                 
             num_spaces = part.count(' ')
             if num_spaces >= 3 or len(part) > 30:
-                return 'MISCELANEUS' # CORRECCIÓN: Todo mayúsculas
+                return 'MISCELANEUS' 
                 
             return current_bu
             
@@ -59,35 +55,114 @@ class BusinessRulesEngine:
         return df_rules
 
 class CostAllocationEngine:
-    def __init__(self, allocation_type: Literal['weight', 'full_container'] = 'weight'):
-        self.allocation_type = allocation_type
-        # Tarifas maestras de Johnson Electric
-        self.fallback_costs = {
-            'sea': 2500.0,
-            'land': 1200.0,  # Corregido al valor BZ1 de tu Excel
-            'outbound': 2000.0
-        }
+    def __init__(self, allocation_type: str = 'weight', fallback_costs: dict = None, default_cost: float = 0.0):
+        self.output_sheet = "Audit_Report"
+        self.allocation_type = allocation_type if allocation_type in ('weight', 'equal') else 'weight'
+        self.fallback_costs = fallback_costs or {}
+        self.default_cost = default_cost
 
-    def _clean_ref(self, ref: Any) -> str:
-        if pd.isna(ref): return None
-        pattern = r"\w?\w-J-\d{4}LI\d{2}"
-        match = re.search(pattern, str(ref).upper())
-        if match: return match.group(0)
-        return re.sub(r'[^A-Z0-9]', '', str(ref).upper())
+    def _find_cost_reference_column(self, df: pd.DataFrame) -> str:
+        """Identifica la columna de referencia en el archivo de costos."""
+        candidates = [
+            c for c in df.columns
+            if any(tok in c.lower() for tok in ['ref', 'reference', 'waybill', 'awb', 'tracking', 'guia', 'shipment', 'documento'])
+        ]
+        if candidates:
+            return candidates[0]
+        candidates = [c for c in df.columns if 'bu' in c.lower()]
+        if candidates:
+            return candidates[0]
+        raise ValueError("No se pudo identificar la columna de referencia en el archivo de costos.")
+
+    def _find_cost_value_column(self, df: pd.DataFrame) -> str:
+        """Identifica la columna de valor/costo en el archivo de costos."""
+        candidates = [
+            c for c in df.columns
+            if any(tok in c.lower() for tok in ['fix cost', 'fix', 'amount', 'cost', 'usd', 'valor', 'importe', 'price', 'monto'])
+        ]
+        if candidates:
+            return candidates[0]
+        return df.columns[-1]
+
+    def _clean_ref(self, raw_ref: Any) -> str:
+        """
+        LIMPIEZA CRÍTICA: Remueve sufijos para asegurar match de costos.
+        Ej: 'FG-R-2180LE25.M46-M45-2' -> 'FG-R-2180LE25'
+        """
+        val = str(raw_ref).strip().upper()
+        if val in ['NAN', 'NONE', '', 'NULL']:
+            return 'UNKNOWN'
+        
+        # 1. Cortar en el primer punto (Quita .M46, .PFA, etc)
+        if '.' in val:
+            val = val.split('.')[0]
+            
+        # 2. Extraer solo el patrón de guía estándar si existe
+        match = re.search(r'^(FG-R-\w+)', val)
+        if match:
+            return match.group(1)
+            
+        return val
+    
+    def calculate_in_memory(self, df_transactions: pd.DataFrame, df_costs: pd.DataFrame = None) -> pd.DataFrame:
+        """
+        Motor de cálculo en Pandas para poblar el Dashboard interactivo de Streamlit.
+        Replica la lógica de Excel (SUMIFS y XLOOKUP) en memoria.
+        """
+        df = df_transactions.copy()
+        
+        # 1. Limpieza de Llave (Garantiza el match)
+        df['group_key'] = df['reference'].apply(self._clean_ref)
+        
+        # 2. Equivalente a SUMIFS de Excel: Proporción por Peso
+        total_weight = df.groupby('group_key')['gross_weight'].transform('sum')
+        # Evitamos división por cero asignando 0 si no hay peso
+        df['%PCT'] = np.where(total_weight > 0, df['gross_weight'] / total_weight, 0.0)
+        
+        # Inicializamos la columna monetaria
+        df['Arg. Var $'] = 0.0
+        
+        # 3. Equivalente a XLOOKUP de Excel: Cruce de Costos (Outbound)
+        if df_costs is not None and not df_costs.empty:
+            try:
+                # Detectar columnas de la tabla de costos
+                ref_col = [c for c in df_costs.columns if 'REF' in c.upper()][0]
+                val_col = [c for c in df_costs.columns if any(k in c.upper() for k in ['FIX', 'COST', 'USD'])][0]
+                
+                # Consolidar Costos Facturados
+                costs_clean = df_costs[[ref_col, val_col]].copy()
+                costs_clean.columns = ['Cost_Ref', 'Amount']
+                costs_clean['Cost_Ref'] = costs_clean['Cost_Ref'].apply(self._clean_ref)
+                costs_clean = costs_clean.groupby('Cost_Ref', as_index=False)['Amount'].sum()
+                
+                # Diccionario de cruce rápido (Hash Map)
+                cost_map = dict(zip(costs_clean['Cost_Ref'], costs_clean['Amount']))
+                
+                # Filtrar transacciones Outbound
+                mask_outbound = df['transport_type'].str.upper() == 'OUTBOUND'
+                
+                # Mapear costo total facturado a cada transacción
+                df.loc[mask_outbound, 'Total_Invoice_Cost'] = df.loc[mask_outbound, 'group_key'].map(cost_map).fillna(0)
+                
+                # Aplicar prorrateo financiero: Costo * Porcentaje
+                df.loc[mask_outbound, 'Arg. Var $'] = df.loc[mask_outbound, '%PCT'] * df.loc[mask_outbound, 'Total_Invoice_Cost']
+            
+            except Exception as e:
+                logger.warning(f"Advertencia en cálculo en memoria: {e}")
+                
+        return df
 
     def generate_auditable_excel(self, df_transactions: pd.DataFrame, df_costs: pd.DataFrame, buffer: BytesIO):
         """
-        Enrutador (Router) que divide el DataFrame unificado y delega la 
-        inyección de fórmulas según el tipo de transporte.
+        Enrutador que genera el reporte con inyección de fórmulas dinámicas.
         """
         try:
             writer = pd.ExcelWriter(buffer, engine='xlsxwriter')
             
-            # Dividir los flujos
+            # Separar flujos
             df_inbound = df_transactions[df_transactions['transport_type'].isin(['Land', 'Sea'])].copy()
             df_outbound = df_transactions[df_transactions['transport_type'].str.upper() == 'OUTBOUND'].copy()
             
-            # Ejecutar estrategias de inyección
             if not df_inbound.empty:
                 self._inject_inbound_formulas(writer, df_inbound, df_costs)
                 
@@ -97,8 +172,58 @@ class CostAllocationEngine:
             writer.close()
             return buffer
         except Exception as e:
-            logger.error(f"Fallo crítico en el enrutador de auditoría: {e}")
+            logger.error(f"Error en generación de Excel: {e}")
             raise
+
+    def _inject_outbound_formulas(self, writer: pd.ExcelWriter, df: pd.DataFrame, df_costs: pd.DataFrame):
+        """
+        Estrategia Outbound: Inyecta XLOOKUP contra matriz de costos limpiada.
+        """
+        # 1. Aplicar Reglas de Negocio
+        df = BusinessRulesEngine.apply_classification_rules(df)
+        df['group_key'] = df['reference'].apply(self._clean_ref)
+        
+        # 2. Preparar Matriz de Costos (Deduplicada por Llave Limpia)
+        ref_col_cost = [c for c in df_costs.columns if 'REF' in c.upper()][0]
+        val_col_cost = [c for c in df_costs.columns if any(k in c.upper() for k in ['FIX', 'COST', 'USD'])][0]
+        
+        costs_clean = df_costs[[ref_col_cost, val_col_cost]].copy()
+        costs_clean.columns = ['Cost_Ref', 'Amount']
+        costs_clean['Cost_Ref'] = costs_clean['Cost_Ref'].apply(self._clean_ref)
+        # Sumamos costos si la misma guía aparece varias veces en factura
+        costs_clean = costs_clean.groupby('Cost_Ref', as_index=False)['Amount'].sum()
+
+        # 3. Escribir tablas en Excel
+        # Col A-B: Diccionario de Costos | Col D-I: Datos Operativos
+        costs_clean.to_excel(writer, sheet_name='Outbound_Auditable', index=False, startcol=0)
+        
+        cols_to_exp = ['reference', 'bu', 'part_number', 'gross_weight', 'transport_type', 'group_key']
+        df[cols_to_exp].to_excel(writer, sheet_name='Outbound_Auditable', index=False, startcol=3)
+        
+        workbook = writer.book
+        worksheet = writer.sheets['Outbound_Auditable']
+        
+        # Formatos
+        money = workbook.add_format({'num_format': '$#,##0.00'})
+        pct = workbook.add_format({'num_format': '0.000%'})
+        header = workbook.add_format({'bold': True, 'bg_color': '#D3D3D3', 'border': 1})
+        
+        col_weight = 'G' 
+        col_key = 'I'   
+        
+        worksheet.write('K1', '% Proportion', header)
+        worksheet.write('L1', 'Calc_Amount', header)
+        
+        for i in range(2, len(df) + 2):
+            # Prorrateo por peso: Peso_Fila / Suma_Pesos_Misma_Guia
+            f_prop = f'=IFERROR({col_weight}{i}/SUMIFS({col_weight}:{col_weight}, {col_key}:{col_key}, {col_key}{i}), 0)'
+            worksheet.write_formula(f'K{i}', f_prop, pct)
+            
+            # Cruce de Costo: Buscar GroupKey en Col A y traer Monto de Col B
+            f_val = f'=XLOOKUP({col_key}{i}, A:A, B:B, 0) * K{i}'
+            worksheet.write_formula(f'L{i}', f_val, money)
+
+        worksheet.set_column('A:L', 15)
 
     def _inject_inbound_formulas(self, writer: pd.ExcelWriter, df: pd.DataFrame, df_costs: pd.DataFrame):
         """Estrategia para Land/Sea (Costo Global Fijo)."""
@@ -125,34 +250,6 @@ class CostAllocationEngine:
             
         worksheet.write(0, 5, '% Propot'); worksheet.write(0, 6, 'Amount')
         worksheet.set_column('A:G', 15)
-
-    def _inject_outbound_formulas(self, writer: pd.ExcelWriter, df: pd.DataFrame, df_costs: pd.DataFrame):
-        """Estrategia para Outbound (Matriz de Costos por Referencia - XLOOKUP)."""
-        df = BusinessRulesEngine.apply_classification_rules(df)
-        df['group_key'] = df['reference'].apply(self._clean_ref).fillna('UNKNOWN')
-        
-        ref_col = [c for c in df_costs.columns if 'ref' in c.lower() or 'bu' in c.lower()][0]
-        cost_col = [c for c in df_costs.columns if 'cost' in c.lower() or 'usd' in c.lower()][0]
-        
-        costs_subset = df_costs[[ref_col, cost_col]].rename(columns={ref_col: 'Cost_Ref', cost_col: 'Fix_Cost'})
-        costs_subset['Cost_Ref'] = costs_subset['Cost_Ref'].apply(self._clean_ref)
-        costs_subset = costs_subset.groupby('Cost_Ref', as_index=False)['Fix_Cost'].sum()
-
-        costs_subset.to_excel(writer, sheet_name='Outbound_Auditable', index=False, startcol=0)
-        
-        cols_to_export = ['reference', 'bu', 'gross_weight', 'transport_type', 'group_key']
-        df[cols_to_export].to_excel(writer, sheet_name='Outbound_Auditable', index=False, startcol=3)
-        
-        workbook, worksheet = writer.book, writer.sheets['Outbound_Auditable']
-        money_fmt = workbook.add_format({'num_format': '$#,##0.00'})
-        pct_fmt = workbook.add_format({'num_format': '0.000%'})
-        
-        for i in range(2, len(df) + 2):
-            worksheet.write_formula(f'I{i}', f'=IFERROR(F{i}/SUMIFS(F:F, H:H, H{i}), 0)', pct_fmt)
-            worksheet.write_formula(f'J{i}', f'=XLOOKUP(H{i}, A:A, B:B, 0) * I{i}', money_fmt)
-            
-        worksheet.write(0, 8, '% Propot'); worksheet.write(0, 9, 'Calc_Exp')
-        worksheet.set_column('A:J', 16)
 
     def calculate_outbound(self, df_transactions: pd.DataFrame, df_costs: pd.DataFrame) -> pd.DataFrame:
         df = df_transactions.copy()
@@ -220,7 +317,14 @@ class CostAllocationEngine:
 
             df = df.merge(costs_subset, left_on='group_key', right_on='financial_key', how='left')
             
-            # 5. Sistema Fallback Tarifario
+            # Debug: Log matches
+            matched = df['Total Cost'].notna().sum()
+            total = len(df)
+            logger.info(f"Cost matching: {matched}/{total} rows have cost data")
+            if matched == 0:
+                logger.warning("No cost matches found. Check reference formats in cost file.")
+                logger.info(f"Sample group_keys: {df['group_key'].head().tolist()}")
+                logger.info(f"Sample financial_keys: {costs_subset['financial_key'].head().tolist() if not costs_subset.empty else 'No cost data'}")
             df['fixed_cost'] = 0.0
             
             def apply_fallback(row):
@@ -232,7 +336,15 @@ class CostAllocationEngine:
                 return row['Total Cost'], 0.0
 
             df[['Total Cost', 'fixed_cost']] = df.apply(apply_fallback, axis=1, result_type='expand')
-            df['Total Cost'] = pd.to_numeric(df['Total Cost'], errors='coerce').fillna(0)
+            df['Total Cost'] = pd.to_numeric(df['Total Cost'], errors='coerce')
+            
+            # If no matches or partial matches, use average cost for missing ones
+            if df['Total Cost'].isna().any() and not costs_subset.empty:
+                avg_cost = costs_subset['Total Cost'].mean()
+                df['Total Cost'] = df['Total Cost'].fillna(avg_cost)
+                logger.info(f"Using average cost {avg_cost} for unmatched references")
+            else:
+                df['Total Cost'] = df['Total Cost'].fillna(0)
             
             df.loc[df['fixed_cost'] > 0, 'note'] += f'Costo estándar aplicado; '
             df.loc[df['gross_weight'] <= 0, 'note'] += 'Peso imputado; '
